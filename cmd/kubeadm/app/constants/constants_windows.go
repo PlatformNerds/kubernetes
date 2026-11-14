@@ -19,6 +19,9 @@ limitations under the License.
 package constants
 
 const (
+	// KubernetesDir is the directory Kubernetes owns for storing various configuration files
+	KubernetesDir = "/etc/kubernetes"
+
 	// CRISocketContainerd is the containerd CRI endpoint
 	CRISocketContainerd = "npipe:////./pipe/containerd-containerd"
 	// CRISocketCRIO is the cri-o CRI endpoint
@@ -29,4 +32,7 @@ const (
 
 	// DefaultCRISocket defines the default CRI socket
 	DefaultCRISocket = CRISocketContainerd
+
+	// KubeletRunDirectory specifies the directory where the kubelet runtime information is stored.
+	KubeletRunDirectory = "/var/lib/kubelet"
 )
