@@ -37,8 +37,66 @@ func (m *kubeGenericRuntimeManager) applyPlatformSpecificContainerConfig(ctx con
 	}
 	config.Linux = &runtimeapi.LinuxContainerConfig{
 		SecurityContext: sc,
+		Resources:       m.generateFreeBSDContainerResources(container),
 	}
 	return nil
+}
+
+// FreeBSD has no cgroups and CRI has no FreeBSD resource message, so resource
+// limits travel in the CRI LinuxContainerResources message: CRI-O turns it
+// into OCI linux.resources and the OCI runtime (ocijail) turns that into
+// rctl(8) rules on the container's jail:
+//
+//	limits.memory -> memory_limit_in_bytes -> swapuse:deny + memoryuse:deny
+//	limits.cpu    -> cpu_quota/cpu_period  -> pcpu:deny (percent of one CPU)
+//	requests.cpu  -> cpu_shares            -> no FreeBSD equivalent (ignored)
+const (
+	freebsdQuotaPeriod    = 100000 // usec, same default as CFS
+	freebsdMinQuotaPeriod = 1000
+	freebsdMinShares      = 2
+	freebsdMaxShares      = 262144
+	freebsdSharesPerCPU   = 1024
+)
+
+func (m *kubeGenericRuntimeManager) generateFreeBSDContainerResources(container *v1.Container) *runtimeapi.LinuxContainerResources {
+	res := &runtimeapi.LinuxContainerResources{}
+
+	if mem := container.Resources.Limits.Memory(); !mem.IsZero() {
+		res.MemoryLimitInBytes = mem.Value()
+	}
+
+	if req := container.Resources.Requests.Cpu(); !req.IsZero() {
+		res.CpuShares = freebsdMilliCPUToShares(req.MilliValue())
+	}
+
+	if lim := container.Resources.Limits.Cpu(); !lim.IsZero() && m.cpuCFSQuota {
+		period := int64(freebsdQuotaPeriod)
+		if p := m.cpuCFSQuotaPeriod.Duration.Microseconds(); p > 0 {
+			period = p
+		}
+		res.CpuPeriod = period
+		res.CpuQuota = freebsdMilliCPUToQuota(lim.MilliValue(), period)
+	}
+	return res
+}
+
+func freebsdMilliCPUToShares(milliCPU int64) int64 {
+	shares := milliCPU * freebsdSharesPerCPU / 1000
+	if shares < freebsdMinShares {
+		return freebsdMinShares
+	}
+	if shares > freebsdMaxShares {
+		return freebsdMaxShares
+	}
+	return shares
+}
+
+func freebsdMilliCPUToQuota(milliCPU, period int64) int64 {
+	quota := milliCPU * period / 1000
+	if quota < freebsdMinQuotaPeriod {
+		quota = freebsdMinQuotaPeriod
+	}
+	return quota
 }
 
 // generateContainerResources generates platform specific container resources config for runtime
