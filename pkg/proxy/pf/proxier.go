@@ -407,13 +407,26 @@ func anchorName(servicePortName string, protocol string, ipFamily v1.IPFamily) s
 	return fmt.Sprintf("kube-svc-%s-%s", af, portProtoHash(servicePortName, protocol))
 }
 
-func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int) {
-	proxier.pfData.Write(
+// redirectRule writes an rdr rule from destinationIP:destinationPort to the
+// endpoints in targetIPs (a single address or a pf address list "{ a, b }").
+// With more than one endpoint the pool is round-robin; with sticky (Service
+// sessionAffinity: ClientIP) pf's sticky-address keeps each client address on
+// the same endpoint for as long as pf tracks the source (while the client has
+// states; the global "set timeout src.track" extends that).
+func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int, sticky bool) {
+	words := []interface{}{
 		"rdr", af, "proto", proto,
 		"from any to", destinationIP.String(),
 		"port", strconv.Itoa(destinationPort),
 		"->", targetIPs, "port", strconv.Itoa(targetPort),
-	)
+	}
+	if strings.HasPrefix(targetIPs, "{") {
+		words = append(words, "round-robin")
+		if sticky {
+			words = append(words, "sticky-address")
+		}
+	}
+	proxier.pfData.Write(words...)
 }
 
 func (proxier *Proxier) natRule(af, proto string, targetIPs string, targetPort int) {
@@ -549,14 +562,15 @@ func (proxier *Proxier) syncProxyRules() error {
 		// We need to redirect the service ip+port and optionally also
 		// the node port address+port
 		proxier.pfData.Reset()
-		proxier.redirectRule(af, proto, svcInfo.ClusterIP(), svcInfo.Port(), redirHosts, targetPort)
+		sticky := svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP
+		proxier.redirectRule(af, proto, svcInfo.ClusterIP(), svcInfo.Port(), redirHosts, targetPort, sticky)
 		if svcInfo.NodePort() != 0 {
 			for _, ip := range nodeIPs {
 				// Don't try to redirect ::1/128 or 127.0.0.0/8
 				if ip.IsLoopback() {
 					continue
 				}
-				proxier.redirectRule(af, proto, ip, svcInfo.NodePort(), redirHosts, targetPort)
+				proxier.redirectRule(af, proto, ip, svcInfo.NodePort(), redirHosts, targetPort, sticky)
 			}
 			// Remove the NAT rules for now. The default
 			// LocalModeClusterCIDR would change the source address
