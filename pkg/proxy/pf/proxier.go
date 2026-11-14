@@ -232,7 +232,7 @@ func NewDualStackProxier(
 		minSyncPeriod,
 		localDetectors[v1.IPv6Protocol],
 		nodeName,
-		nodeIPs[v1.IPv4Protocol],
+		nodeIPs[v1.IPv6Protocol],
 		recorder,
 		healthzServer,
 		nodePortAddresses,
@@ -407,19 +407,27 @@ func anchorName(servicePortName string, protocol string, ipFamily v1.IPFamily) s
 	return fmt.Sprintf("kube-svc-%s-%s", af, portProtoHash(servicePortName, protocol))
 }
 
+// nodePortTag marks packets redirected by a NodePort rdr rule so that
+// nodePortSNATRule can masquerade the ones forwarded to other nodes.
+const nodePortTag = "KUBE_NODEPORT"
+
 // redirectRule writes an rdr rule from destinationIP:destinationPort to the
 // endpoints in targetIPs (a single address or a pf address list "{ a, b }").
 // With more than one endpoint the pool is round-robin; with sticky (Service
 // sessionAffinity: ClientIP) pf's sticky-address keeps each client address on
 // the same endpoint for as long as pf tracks the source (while the client has
-// states; the global "set timeout src.track" extends that).
-func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int, sticky bool) {
+// states; the global "set timeout src.track" extends that). A non-empty tag
+// is attached to the redirected packets.
+func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int, sticky bool, tag string) {
 	words := []interface{}{
 		"rdr", af, "proto", proto,
 		"from any to", destinationIP.String(),
 		"port", strconv.Itoa(destinationPort),
-		"->", targetIPs, "port", strconv.Itoa(targetPort),
 	}
+	if tag != "" {
+		words = append(words, "tag", tag)
+	}
+	words = append(words, "->", targetIPs, "port", strconv.Itoa(targetPort))
 	if strings.HasPrefix(targetIPs, "{") {
 		words = append(words, "round-robin")
 		if sticky {
@@ -429,13 +437,22 @@ func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, des
 	proxier.pfData.Write(words...)
 }
 
-func (proxier *Proxier) natRule(af, proto string, targetIPs string, targetPort int) {
+// nodePortSNATRule masquerades NodePort traffic that was redirected to an
+// endpoint on another node (remoteIPs) to this node's IP. Without it the
+// endpoint replies straight to the client, bypassing this node, so the rdr is
+// never reversed and the connection fails: e.g. a client on node B calling
+// nodeA:nodePort with the endpoint on node B, or any external client whose
+// return path doesn't run through this node. Only packets tagged by a NodePort
+// rdr match: ClusterIP traffic keeps its source address, and with
+// externalTrafficPolicy: Local there are no remote endpoints, so client
+// addresses are preserved as the API promises.
+func (proxier *Proxier) nodePortSNATRule(af, proto string, remoteIPs string, targetPort int) {
 	proxier.pfData.Write(
 		"nat", af, "proto", proto,
-		"from", proxier.localDetector.IfNotLocal(),
-		"to", targetIPs,
+		"from any to", remoteIPs,
 		"port", strconv.Itoa(targetPort),
-		"->", proxier.localDetector.ToAddress(),
+		"tagged", nodePortTag,
+		"->", proxier.nodeIP.String(),
 	)
 }
 
@@ -563,24 +580,32 @@ func (proxier *Proxier) syncProxyRules() error {
 		// the node port address+port
 		proxier.pfData.Reset()
 		sticky := svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP
-		proxier.redirectRule(af, proto, svcInfo.ClusterIP(), svcInfo.Port(), redirHosts, targetPort, sticky)
+		proxier.redirectRule(af, proto, svcInfo.ClusterIP(), svcInfo.Port(), redirHosts, targetPort, sticky, "")
 		if svcInfo.NodePort() != 0 {
 			for _, ip := range nodeIPs {
 				// Don't try to redirect ::1/128 or 127.0.0.0/8
 				if ip.IsLoopback() {
 					continue
 				}
-				proxier.redirectRule(af, proto, ip, svcInfo.NodePort(), redirHosts, targetPort, sticky)
+				proxier.redirectRule(af, proto, ip, svcInfo.NodePort(), redirHosts, targetPort, sticky, nodePortTag)
 			}
-			// Remove the NAT rules for now. The default
-			// LocalModeClusterCIDR would change the source address
-			// of all incoming connections to node-port services to
-			// a single address which is likely to result in
-			// asymmetric routing for nodes which don't own that
-			// address which will not work since the return path
-			// will not be able to reverse the NAT.
-
-			// proxier.natRule(af, proto, redirHosts, targetPort)
+			// Masquerade only what goes to other nodes, to this node's
+			// own address: a single cluster-wide masquerade address
+			// (LocalModeClusterCIDR) would route replies to a node
+			// that can't reverse the NAT.
+			remoteIPs := []string{}
+			for _, ep := range targetEndpoints {
+				if !ep.IsLocal() {
+					remoteIPs = append(remoteIPs, ep.IP())
+				}
+			}
+			if len(remoteIPs) > 0 {
+				if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
+					klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", svcName)
+				} else {
+					proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(remoteIPs, ", ")+" }", targetPort)
+				}
+			}
 		}
 
 		if proxier.logger.V(2).Enabled() {
