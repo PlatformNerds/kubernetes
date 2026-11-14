@@ -1,5 +1,3 @@
-//go:build freebsd
-
 /*
 Copyright 2026 The Kubernetes Authors.
 
@@ -20,8 +18,10 @@ package pf
 
 import (
 	"net"
+	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 )
 
@@ -59,5 +59,42 @@ func TestNodePortSNATRule(t *testing.T) {
 	want := "nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n"
 	if got := p.pfData.String(); got != want {
 		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestStaleUDPStates(t *testing.T) {
+	out := `all tcp 10.244.1.7:8080 (192.168.100.2:30080) <- 10.244.0.88:5555       ESTABLISHED:ESTABLISHED
+all udp 10.244.1.7:8081 (192.168.100.2:30081) <- 10.244.0.88:4444       MULTIPLE:MULTIPLE
+all udp 10.244.1.9:8081 (10.96.0.20:81) <- 10.244.0.88:4445       MULTIPLE:MULTIPLE
+all udp 10.244.1.9:8082 (10.96.0.20:81) <- 10.244.0.88:4446       MULTIPLE:MULTIPLE
+all udp 10.244.1.5:53 (10.96.0.99:53) <- 10.244.0.88:4447       MULTIPLE:MULTIPLE
+all udp fd00::7[53] (fd01::a[53]) <- fd00::8[4448]       MULTIPLE:MULTIPLE
+all udp 192.168.100.1:61234 (10.244.0.88:4444) -> 10.244.1.7:8081       MULTIPLE:MULTIPLE
+all udp 10.0.2.15:68 <- 10.0.2.2:67       MULTIPLE:MULTIPLE
+`
+	states := parseRdrStates(out)
+	if len(states) != 6 {
+		t.Fatalf("parsed %d rdr states, want 6: %v", len(states), states)
+	}
+	fronts := udpFrontends{
+		// endpoint 10.244.1.7 is gone: state 4444 is stale
+		pfAddrPort("192.168.100.2", 30081): sets.New(pfAddrPort("10.244.1.8", 8081)),
+		// target port changed 8081 -> 8082: state 4445 is stale, 4446 is not
+		pfAddrPort("10.96.0.20", 81): sets.New(pfAddrPort("10.244.1.9", 8082)),
+		// no endpoints left: state 4448 is stale
+		pfAddrPort("fd01::a", 53): sets.New[string](),
+		// 10.96.0.99:53 is not a known UDP frontend: 4447 is left alone
+	}
+	var got []string
+	for _, s := range staleUDPStates(states, fronts) {
+		got = append(got, s.key())
+	}
+	want := []string{
+		"udp 192.168.100.2:30081 <- 10.244.0.88:4444",
+		"udp 10.96.0.20:81 <- 10.244.0.88:4445",
+		"udp fd01::a[53] <- fd00::8[4448]",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("stale states:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }

@@ -509,6 +509,9 @@ func (proxier *Proxier) syncProxyRules() error {
 		klog.ErrorS(err, "Failed to get node ip address matching nodeport cidrs, services with nodeport may not work as intended", "CIDRs", proxier.nodePortAddresses)
 	}
 
+	// UDP frontends and their current endpoints, for killStaleUDPStates.
+	udpFronts := udpFrontends{}
+
 	// Build rules for each service-port.
 	for svcName, svc := range proxier.svcPortMap {
 		svcInfo, ok := svc.(*servicePortInfo)
@@ -550,7 +553,25 @@ func (proxier *Proxier) syncProxyRules() error {
 				targetPort = port
 			}
 		}
+		if svcInfo.Protocol() == v1.ProtocolUDP {
+			endpoints := sets.New[string]()
+			for _, ep := range targetEndpoints {
+				endpoints.Insert(pfAddrPort(ep.IP(), targetPort))
+			}
+			udpFronts[pfAddrPort(svcInfo.ClusterIP().String(), svcInfo.Port())] = endpoints
+			if svcInfo.NodePort() != 0 {
+				for _, ip := range nodeIPs {
+					udpFronts[pfAddrPort(ip.String(), svcInfo.NodePort())] = endpoints
+				}
+			}
+		}
 		if len(targetEndpoints) == 0 {
+			// No endpoints (left): drop the rules that still redirect
+			// to the old ones.
+			cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+svcInfo.anchorName, "-F", "nat")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				klog.ErrorS(err, "Failed to flush rules of service without endpoints", "service", svcName, "output", string(out))
+			}
 			continue
 		}
 
@@ -624,6 +645,7 @@ func (proxier *Proxier) syncProxyRules() error {
 			klog.Errorf("error loading rules input: '%s', output: %s, err: %v", input, output, err)
 		}
 	}
+	proxier.killStaleUDPStates(udpFronts)
 	for a := range staleAnchors {
 		proxier.logger.V(2).Info("deleting PF anchor", a)
 		cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+a, "-F", "nat")
