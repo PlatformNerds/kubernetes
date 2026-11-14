@@ -18,12 +18,6 @@ limitations under the License.
 
 package cadvisor
 
-// #include <unistd.h>
-// #include <sys/vmmeter.h>
-// #include <sys/sysctl.h>
-// #include <vm/vm_param.h>
-import "C"
-
 import (
 	"bytes"
 	"context"
@@ -168,20 +162,30 @@ func (cu *cadvisorClient) GetRequestedContainersInfo(containerName string, optio
 	return nil, nil
 }
 
+// vmtotal mirrors struct vmtotal from <sys/vmmeter.h> (stable layout since FreeBSD 12).
+// Defined in Go so the kubelet can be built with CGO_ENABLED=0 and cross-compiled.
+type vmtotal struct {
+	VM, AVM, RM, ARM, VMShr, AVMShr, RMShr, ARMShr, Free uint64
+	RQ, DW, PW, SL, SW                                   int16
+	_                                                    [3]uint16
+}
+
 func getMemInfo() (int64, int64, error) {
 	data, err := unix.SysctlRaw("vm.vmtotal")
 	if err != nil {
 		return -1, -1, fmt.Errorf("can't get kernel info: %w", err)
 	}
-	if len(data) != C.sizeof_struct_vmtotal {
+	if len(data) != int(unsafe.Sizeof(vmtotal{})) {
 		return -1, -1, fmt.Errorf("unexpected vmtotal size %d", len(data))
 	}
+	total := (*vmtotal)(unsafe.Pointer(&data[0]))
 
-	total := (*C.struct_vmtotal)(unsafe.Pointer(&data[0]))
-
-	pagesize := int64(C.sysconf(C._SC_PAGESIZE))
-	npages := int64(C.sysconf(C._SC_PHYS_PAGES))
-	return pagesize * npages, pagesize * int64(total.t_free), nil
+	physmem, err := unix.SysctlUint64("hw.physmem")
+	if err != nil {
+		return -1, -1, fmt.Errorf("can't get hw.physmem value: %w", err)
+	}
+	pagesize := int64(unix.Getpagesize())
+	return int64(physmem), pagesize * int64(total.Free), nil
 }
 
 func createRootContainerInfo() (*cadvisorapiv2.ContainerInfo, error) {
@@ -297,24 +301,36 @@ func getRacct(filter string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	var buf [1024]byte
-	_, _, errno := syscall.Syscall6(syscall.SYS_RCTL_GET_RACCT,
-		uintptr(unsafe.Pointer(&bp[0])),
-		uintptr(len(bp)),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(len(buf)), 0, 0)
-	if errno != 0 {
-		return nil, fmt.Errorf("error calling rctl_get_racct with filter %s: %v", errno)
+	// rctl_get_racct returns ERANGE when the buffer is too small; grow and retry.
+	var buf []byte
+	for size := 1024; ; size *= 2 {
+		buf = make([]byte, size)
+		_, _, errno := syscall.Syscall6(syscall.SYS_RCTL_GET_RACCT,
+			uintptr(unsafe.Pointer(&bp[0])),
+			uintptr(len(bp)),
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(len(buf)), 0, 0)
+		if errno == syscall.ERANGE && size < 1<<20 {
+			continue
+		}
+		if errno != 0 {
+			return nil, fmt.Errorf("error calling rctl_get_racct with filter %s: %w", filter, errno)
+		}
+		break
 	}
-	len := bytes.IndexByte(buf[:], byte(0))
-	entries := strings.Split(string(buf[:len]), ",")
+	if n := bytes.IndexByte(buf, 0); n >= 0 {
+		buf = buf[:n]
+	}
 	res := make(map[string]uint64)
-	for _, entry := range entries {
-		kv := strings.SplitN(entry, "=", 2)
-		key := kv[0]
-		val, err := strconv.ParseUint(kv[1], 10, 0)
+	for _, entry := range strings.Split(string(buf), ",") {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		val, err := strconv.ParseUint(value, 10, 64)
 		if err != nil {
 			klog.Warningf("unexpected rctl entry, ignoring: %s", entry)
+			continue
 		}
 		res[key] = val
 	}
