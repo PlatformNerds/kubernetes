@@ -1,4 +1,4 @@
-//go:build !linux && !windows
+//go:build !linux && !windows && !freebsd
 
 /*
 Copyright The Kubernetes Authors.
@@ -18,7 +18,15 @@ limitations under the License.
 
 package mounttest
 
-import "strconv"
+import (
+	"strconv"
+	"syscall"
+)
+
+// statfsTypeName returns a string representation of the filesystem type of buf.
+func statfsTypeName(buf *syscall.Statfs_t) string {
+	return formatFsType(int64(buf.Type))
+}
 
 // formatFsType returns a string representation of the filesystem type.
 func formatFsType(fsType int64) string {

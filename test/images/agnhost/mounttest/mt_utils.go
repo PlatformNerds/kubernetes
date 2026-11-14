@@ -39,7 +39,7 @@ func fsType(path string) error {
 		return err
 	}
 
-	fmt.Printf("mount type of %q: %s\n", path, formatFsType(int64(buf.Type)))
+	fmt.Printf("mount type of %q: %s\n", path, statfsTypeName(&buf))
 
 	return nil
 }

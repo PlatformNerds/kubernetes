@@ -20,9 +20,15 @@ package mounttest
 
 import (
 	"strconv"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+// statfsTypeName returns a string representation of the filesystem type of buf.
+func statfsTypeName(buf *syscall.Statfs_t) string {
+	return formatFsType(int64(buf.Type))
+}
 
 // formatFsType returns a string representation of the filesystem type.
 // It translates known filesystem magic numbers to human-readable names.
