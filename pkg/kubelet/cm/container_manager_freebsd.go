@@ -195,7 +195,24 @@ func (cm *containerManagerImpl) GetDevicePluginResourceCapacity() (v1.ResourceLi
 }
 
 func (cm *containerManagerImpl) NewPodContainerManager() PodContainerManager {
-	return &podContainerManagerStub{}
+	return &podContainerManagerFreeBSD{}
+}
+
+// podContainerManagerFreeBSD: FreeBSD has no pod cgroup. Container limits are
+// rctl rules on each container's jail (set by the runtime), so for in-place
+// resize the pod-level config is reported as unknown (nil, like the Linux
+// no-op manager without cgroups-per-QOS) and setting it is a no-op; the
+// kubelet then resizes the containers through UpdateContainerResources.
+type podContainerManagerFreeBSD struct {
+	podContainerManagerStub
+}
+
+func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(_ *v1.Pod, _ v1.ResourceName) (*ResourceConfig, error) {
+	return nil, nil
+}
+
+func (m *podContainerManagerFreeBSD) SetPodCgroupConfig(_ klog.Logger, _ *v1.Pod, _ *ResourceConfig) error {
+	return nil
 }
 
 func (cm *containerManagerImpl) PodHasExclusiveCPUs(pod *v1.Pod) bool {

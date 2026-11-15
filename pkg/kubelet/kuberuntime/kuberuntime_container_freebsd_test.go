@@ -72,3 +72,56 @@ func TestGenerateFreeBSDContainerResources(t *testing.T) {
 		})
 	}
 }
+
+// In-place resize: the resources the kubelet sends (generateContainerResources)
+// come back from the runtime's ContainerStatus and must convert to the same
+// requests/limits (toKubeContainerResources), or the resize never completes.
+func TestFreeBSDContainerResourcesRoundTrip(t *testing.T) {
+	m := &kubeGenericRuntimeManager{cpuCFSQuota: true, cpuCFSQuotaPeriod: metav1.Duration{Duration: 100 * time.Millisecond}}
+	for _, tc := range []struct {
+		name                string
+		requests, limits    v1.ResourceList
+		wantCPUReq          string
+		wantCPULim, wantMem string
+	}{
+		{"limits and requests",
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("64Mi")},
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m"), v1.ResourceMemory: resource.MustParse("128Mi")},
+			"100m", "200m", "128Mi"},
+		{"resized up",
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("500m")},
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("1500m"), v1.ResourceMemory: resource.MustParse("1Gi")},
+			"500m", "1500m", "1Gi"},
+		{"requests only", v1.ResourceList{v1.ResourceCPU: resource.MustParse("250m")}, nil, "250m", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &v1.Container{Resources: v1.ResourceRequirements{Requests: tc.requests, Limits: tc.limits}}
+			sent := m.generateContainerResources(t.Context(), &v1.Pod{}, c)
+			if sent.GetLinux() == nil {
+				t.Fatalf("no Linux resources sent")
+			}
+			got := toKubeContainerResources(sent)
+			if got == nil {
+				t.Fatalf("no resources converted back")
+			}
+			check := func(what string, q *resource.Quantity, want string) {
+				t.Helper()
+				if want == "" {
+					if q != nil {
+						t.Errorf("%s = %s, want none", what, q.String())
+					}
+					return
+				}
+				if q == nil || q.Cmp(resource.MustParse(want)) != 0 {
+					t.Errorf("%s = %v, want %s", what, q, want)
+				}
+			}
+			check("cpu request", got.CPURequest, tc.wantCPUReq)
+			check("cpu limit", got.CPULimit, tc.wantCPULim)
+			check("memory limit", got.MemoryLimit, tc.wantMem)
+		})
+	}
+	if toKubeContainerResources(nil) != nil || toKubeContainerResources(&runtimeapi.ContainerResources{}) != nil {
+		t.Errorf("nil/empty status should convert to nil")
+	}
+}

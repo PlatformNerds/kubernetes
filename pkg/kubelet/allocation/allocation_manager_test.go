@@ -729,6 +729,9 @@ func TestRetryPendingResizes(t *testing.T) {
 				continue // pod level resources makes the distinction between container types irrelevant
 			}
 			t.Run(fmt.Sprintf("%s/containerType=%s", tt.name, containerType), func(t *testing.T) {
+				if tt.inPlacePodLevelResizeEnabled && goruntime.GOOS == "freebsd" {
+					t.Skip("In-place pod-level resources resize is not supported on FreeBSD")
+				}
 				if tt.inPlacePodLevelResizeEnabled {
 					featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodLevelResourcesVerticalScaling, true)
 				}

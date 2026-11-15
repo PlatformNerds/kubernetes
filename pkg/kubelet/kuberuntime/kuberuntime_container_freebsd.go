@@ -22,6 +22,7 @@ import (
 	"context"
 
 	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -47,7 +48,7 @@ func (m *kubeGenericRuntimeManager) applyPlatformSpecificContainerConfig(ctx con
 // into OCI linux.resources and the OCI runtime (ocijail) turns that into
 // rctl(8) rules on the container's jail:
 //
-//	limits.memory -> memory_limit_in_bytes -> swapuse:deny + memoryuse:deny
+//	limits.memory -> memory_limit_in_bytes -> memoryuse:sigkill
 //	limits.cpu    -> cpu_quota/cpu_period  -> pcpu:deny (percent of one CPU)
 //	requests.cpu  -> cpu_shares            -> no FreeBSD equivalent (ignored)
 const (
@@ -99,18 +100,58 @@ func freebsdMilliCPUToQuota(milliCPU, period int64) int64 {
 	return quota
 }
 
-// generateContainerResources generates platform specific container resources config for runtime
+// generateContainerResources generates platform specific container resources
+// config for runtime: used by in-place resize (UpdateContainerResources), so it
+// must match what container creation sends.
 func (m *kubeGenericRuntimeManager) generateContainerResources(_ context.Context, pod *v1.Pod, container *v1.Container) *runtimeapi.ContainerResources {
-	return nil
+	return &runtimeapi.ContainerResources{
+		Linux: m.generateFreeBSDContainerResources(container),
+	}
 }
 
-// generateUpdatePodSandboxResourcesRequest generates platform specific podsandox resources config for runtime
+// generateUpdatePodSandboxResourcesRequest generates platform specific podsandox
+// resources config for runtime. The kubelet tells the runtime about pod-level
+// changes during a resize and treats a nil request as an error. FreeBSD
+// doesn't enforce pod-level limits (CRI-O only forwards this to NRI), so this
+// is informational.
 func (m *kubeGenericRuntimeManager) generateUpdatePodSandboxResourcesRequest(sandboxID string, pod *v1.Pod, podResources *cm.ResourceConfig) *runtimeapi.UpdatePodSandboxResourcesRequest {
-	return nil
+	return &runtimeapi.UpdatePodSandboxResourcesRequest{
+		PodSandboxId: sandboxID,
+		Resources:    convertResourceConfigToLinuxContainerResources(podResources),
+	}
 }
 
+// toKubeContainerResources converts the resources a runtime reports in
+// ContainerStatus (CRI-O: the container's OCI linux.resources, which ocijail
+// enforces with rctl) to the kubelet's view; the kubelet compares them with
+// the allocated resources to tell when an in-place resize is done.
 func toKubeContainerResources(statusResources *runtimeapi.ContainerResources) *kubecontainer.ContainerResources {
-	return nil
+	r := statusResources.GetLinux()
+	if r == nil {
+		return nil
+	}
+	var cpuLimit, memLimit, cpuRequest *resource.Quantity
+	if r.CpuPeriod > 0 {
+		if milliCPU := cm.QuotaToMilliCPU(r.CpuQuota, r.CpuPeriod); milliCPU > 0 {
+			cpuLimit = resource.NewMilliQuantity(milliCPU, resource.DecimalSI)
+		}
+	}
+	if r.CpuShares > 0 {
+		if milliCPU := cm.SharesToMilliCPU(r.CpuShares); milliCPU > 0 {
+			cpuRequest = resource.NewMilliQuantity(milliCPU, resource.DecimalSI)
+		}
+	}
+	if r.MemoryLimitInBytes > 0 {
+		memLimit = resource.NewQuantity(r.MemoryLimitInBytes, resource.BinarySI)
+	}
+	if cpuLimit == nil && memLimit == nil && cpuRequest == nil {
+		return nil
+	}
+	return &kubecontainer.ContainerResources{
+		CPULimit:    cpuLimit,
+		CPURequest:  cpuRequest,
+		MemoryLimit: memLimit,
+	}
 }
 
 func toKubeContainerUser(statusUser *runtimeapi.ContainerUser) *kubecontainer.ContainerUser {
