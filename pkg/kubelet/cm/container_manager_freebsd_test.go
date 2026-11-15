@@ -23,52 +23,50 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 )
 
-// In-place resize dereferences the pod-level config, so it must always be
-// fully populated, and it must equal what the allocated pod implies (so the
-// kubelet only resizes containers).
-func TestFreeBSDPodContainerManagerGetPodCgroupConfig(t *testing.T) {
+// In-place resize compares the pod-level config the runtime last applied with
+// the desired one, and dereferences every value.
+func TestFreeBSDPodContainerManagerPodCgroupConfig(t *testing.T) {
 	pcm := &podContainerManagerFreeBSD{}
-	res := func(cpu, mem string) v1.ResourceList {
-		rl := v1.ResourceList{}
-		if cpu != "" {
-			rl[v1.ResourceCPU] = resource.MustParse(cpu)
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-1")}}
+	get := func() (int64, int64, uint64) {
+		t.Helper()
+		mem, err := pcm.GetPodCgroupConfig(pod, v1.ResourceMemory)
+		if err != nil || mem.Memory == nil {
+			t.Fatalf("memory config: %+v, %v", mem, err)
 		}
-		if mem != "" {
-			rl[v1.ResourceMemory] = resource.MustParse(mem)
+		cpu, err := pcm.GetPodCgroupConfig(pod, v1.ResourceCPU)
+		if err != nil || cpu.CPUQuota == nil || cpu.CPUPeriod == nil || cpu.CPUShares == nil {
+			t.Fatalf("cpu config: %+v, %v", cpu, err)
 		}
-		return rl
+		return *mem.Memory, *cpu.CPUQuota, *cpu.CPUShares
 	}
-	pod := func(req, lim v1.ResourceList) *v1.Pod {
-		return &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c", Resources: v1.ResourceRequirements{Requests: req, Limits: lim}}}}}
+	ptr := func(v int64) *int64 { return &v }
+	uptr := func(v uint64) *uint64 { return &v }
+
+	// unknown (e.g. after a kubelet restart): unlimited, so the kubelet
+	// sends the pod's limits again
+	if mem, quota, shares := get(); mem != math.MaxInt64 || quota != -1 || shares != MinShares {
+		t.Errorf("unknown pod: %d/%d/%d", mem, quota, shares)
 	}
-	for _, tc := range []struct {
-		name               string
-		pod                *v1.Pod
-		wantMem, wantQuota int64
-		wantShares         uint64
-	}{
-		{"limited", pod(res("100m", "64Mi"), res("200m", "128Mi")), 128 << 20, 20000, 102},
-		{"no limits", pod(res("250m", ""), nil), math.MaxInt64, -1, 256},
-		{"best effort", pod(nil, nil), math.MaxInt64, -1, MinShares},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mem, err := pcm.GetPodCgroupConfig(tc.pod, v1.ResourceMemory)
-			if err != nil || mem == nil || mem.Memory == nil {
-				t.Fatalf("memory config: %+v, %v", mem, err)
-			}
-			if *mem.Memory != tc.wantMem {
-				t.Errorf("memory = %d, want %d", *mem.Memory, tc.wantMem)
-			}
-			cpu, err := pcm.GetPodCgroupConfig(tc.pod, v1.ResourceCPU)
-			if err != nil || cpu == nil || cpu.CPUQuota == nil || cpu.CPUShares == nil || cpu.CPUPeriod == nil {
-				t.Fatalf("cpu config: %+v, %v", cpu, err)
-			}
-			if *cpu.CPUQuota != tc.wantQuota || *cpu.CPUShares != tc.wantShares {
-				t.Errorf("cpu quota/shares = %d/%d, want %d/%d", *cpu.CPUQuota, *cpu.CPUShares, tc.wantQuota, tc.wantShares)
-			}
-		})
+	// recorded at sandbox creation
+	RecordPodLevelConfig(pod.UID, &ResourceConfig{Memory: ptr(256 << 20), CPUQuota: ptr(50000), CPUPeriod: uptr(100000), CPUShares: uptr(512)})
+	if mem, quota, shares := get(); mem != 256<<20 || quota != 50000 || shares != 512 {
+		t.Errorf("recorded: %d/%d/%d", mem, quota, shares)
+	}
+	// a memory-only update keeps the CPU values
+	if err := pcm.SetPodCgroupConfig(klog.Background(), pod, &ResourceConfig{Memory: ptr(512 << 20)}); err != nil {
+		t.Fatal(err)
+	}
+	if mem, quota, shares := get(); mem != 512<<20 || quota != 50000 || shares != 512 {
+		t.Errorf("after memory update: %d/%d/%d", mem, quota, shares)
+	}
+	RecordPodLevelConfig(pod.UID, nil)
+	if mem, _, _ := get(); mem != math.MaxInt64 {
+		t.Errorf("after forget: %d", mem)
 	}
 }

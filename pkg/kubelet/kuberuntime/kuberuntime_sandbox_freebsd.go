@@ -42,5 +42,7 @@ func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, p
 	period := uint64(m.cpuCFSQuotaPeriod.Duration / time.Microsecond)
 	rc := cm.ResourceConfigForPod(pod, m.cpuCFSQuota, period, false, kubeletconfig.NoneMemoryReservationPolicy)
 	config.Linux.Resources = convertResourceConfigToLinuxContainerResources(rc)
+	// What the pod jail starts with, for in-place resize (GetPodCgroupConfig).
+	cm.RecordPodLevelConfig(pod.UID, rc)
 	return nil
 }

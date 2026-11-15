@@ -25,6 +25,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
@@ -38,7 +39,6 @@ import (
 	internalapi "k8s.io/cri-api/pkg/apis"
 	pluginwatcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
-	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
@@ -200,23 +200,47 @@ func (cm *containerManagerImpl) NewPodContainerManager() PodContainerManager {
 	return &podContainerManagerFreeBSD{}
 }
 
-// podContainerManagerFreeBSD: FreeBSD has no pod cgroup. Container limits are
-// rctl rules on each container's jail (set by the runtime) and nothing
-// enforces pod-level limits, so for in-place resize the pod's current
-// pod-level config is reported as what its allocated resources imply (no
-// limit: unlimited memory, quota -1, like an unlimited cgroup), and setting it
-// is a no-op. The kubelet then sees no pod-level change to make and resizes
-// the containers through UpdateContainerResources. (The resize code
-// dereferences these values, so they must not be nil.)
+// podContainerManagerFreeBSD: FreeBSD has no pod cgroup. Pod-level limits are
+// rctl rules on the pod jail (the parent of the container jails), set by the
+// runtime from the sandbox config at creation and from
+// UpdatePodSandboxResources during an in-place resize.
+//
+// The kubelet compares GetPodCgroupConfig with the pod's desired config to
+// decide whether, and in which order, to update the pod-level limits around
+// the container updates. So GetPodCgroupConfig reports what was last applied
+// to the pod jail (recorded at sandbox creation and by SetPodCgroupConfig,
+// which the kubelet calls once the runtime accepted the update). Unknown
+// values (e.g. after a kubelet restart) are reported as unlimited, so the
+// kubelet sends the pod's limits again, which is idempotent. The resize code
+// dereferences these values, so they are never nil.
 type podContainerManagerFreeBSD struct {
 	podContainerManagerStub
 }
 
-func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(pod *v1.Pod, resourceName v1.ResourceName) (*ResourceConfig, error) {
-	rc := ResourceConfigForPod(pod, true, QuotaPeriod, false, kubeletconfig.NoneMemoryReservationPolicy)
+// podLevelApplied maps a pod UID to the pod-level config last applied to its
+// pod jail.
+var podLevelApplied sync.Map
+
+// RecordPodLevelConfig records the pod-level config the runtime was given
+// for a pod's sandbox (nil: none).
+func RecordPodLevelConfig(uid types.UID, rc *ResourceConfig) {
 	if rc == nil {
-		rc = &ResourceConfig{}
+		podLevelApplied.Delete(uid)
+		return
 	}
+	c := *rc
+	podLevelApplied.Store(uid, &c)
+}
+
+func appliedPodLevelConfig(uid types.UID) ResourceConfig {
+	if v, ok := podLevelApplied.Load(uid); ok {
+		return *v.(*ResourceConfig)
+	}
+	return ResourceConfig{}
+}
+
+func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(pod *v1.Pod, resourceName v1.ResourceName) (*ResourceConfig, error) {
+	rc := appliedPodLevelConfig(pod.UID)
 	switch resourceName {
 	case v1.ResourceMemory:
 		memory := int64(math.MaxInt64)
@@ -240,7 +264,26 @@ func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(pod *v1.Pod, resourceNam
 	return nil, fmt.Errorf("unsupported pod resource %q", resourceName)
 }
 
-func (m *podContainerManagerFreeBSD) SetPodCgroupConfig(_ klog.Logger, _ *v1.Pod, _ *ResourceConfig) error {
+// SetPodCgroupConfig records the pod-level values the runtime accepted
+// (UpdatePodSandboxResources, called just before); there is no cgroup to write.
+func (m *podContainerManagerFreeBSD) SetPodCgroupConfig(_ klog.Logger, pod *v1.Pod, update *ResourceConfig) error {
+	if update == nil {
+		return nil
+	}
+	rc := appliedPodLevelConfig(pod.UID)
+	if update.Memory != nil {
+		rc.Memory = update.Memory
+	}
+	if update.CPUQuota != nil {
+		rc.CPUQuota = update.CPUQuota
+	}
+	if update.CPUPeriod != nil {
+		rc.CPUPeriod = update.CPUPeriod
+	}
+	if update.CPUShares != nil {
+		rc.CPUShares = update.CPUShares
+	}
+	RecordPodLevelConfig(pod.UID, &rc)
 	return nil
 }
 

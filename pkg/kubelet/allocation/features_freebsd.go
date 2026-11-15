@@ -19,6 +19,9 @@ limitations under the License.
 package allocation
 
 import (
+	"sync"
+
+	"golang.org/x/sys/unix"
 	v1 "k8s.io/api/core/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/features"
@@ -34,9 +37,23 @@ func IsInPlacePodVerticalScalingAllowed(pod *v1.Pod) (allowed bool, msg, reason 
 	return true, "", ""
 }
 
-// IsInPlacePodLevelResourcesVerticalScalingAllowed: pod-level resources are not
-// enforced on FreeBSD yet (no pod cgroup; rctl on the pod's parent jail would be
-// the equivalent), so they can't be resized either.
+// IsInPlacePodLevelResourcesVerticalScalingAllowed: pod-level limits are rctl
+// rules on the pod jail (the parent of the container jails), which bind the
+// containers only on kernels with kern.features.rctl_jail_hierarchy; the
+// runtime changes them through UpdatePodSandboxResources.
 func IsInPlacePodLevelResourcesVerticalScalingAllowed(pod *v1.Pod) (allowed bool, msg, reason string) {
-	return false, "In-place pod-level resources resize is not supported on FreeBSD", "unsupported_platform"
+	if !utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodLevelResourcesVerticalScaling) {
+		return false, "InPlacePodLevelResourcesVerticalScaling is disabled", "plr_feature_gate_off"
+	}
+	if !rctlJailHierarchy() {
+		return false, "In-place pod-level resources resize needs a kernel that enforces jail rctl rules on child jails (kern.features.rctl_jail_hierarchy)", "unsupported_platform"
+	}
+	return true, "", ""
 }
+
+// rctlJailHierarchy reports whether rctl rules on a jail bind its child jails
+// (kern.features.rctl_jail_hierarchy).
+var rctlJailHierarchy = sync.OnceValue(func() bool {
+	v, err := unix.SysctlUint32("kern.features.rctl_jail_hierarchy")
+	return err == nil && v == 1
+})
