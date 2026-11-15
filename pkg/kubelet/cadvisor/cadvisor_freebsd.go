@@ -194,11 +194,15 @@ func getMemInfo() (int64, int64, error) {
 // kernel memory, so the kubelet saw memory as nearly free until the host ran
 // out, and memory eviction never triggered. Like Linux (usage minus inactive
 // file pages), count what the kernel can reclaim quickly as available: free
-// pages, inactive pages and the part of the ARC above its minimum size. But
-// FreeBSD's inactive queue also holds tmpfs pages, which can't be reclaimed
-// without swap: filling a tmpfs on a 12 GB node made "available" rise to 5 GB
-// while 330 MB were free. So inactive pages only count as reclaimable beyond
-// what tmpfs holds (conservative: tmpfs pages still active are subtracted too).
+// pages and inactive pages. But FreeBSD's inactive queue also holds tmpfs
+// pages, which can't be reclaimed without swap: filling a tmpfs on a 12 GB
+// node made "available" rise to 5 GB while 330 MB were free. So inactive
+// pages only count as reclaimable beyond what tmpfs holds (conservative:
+// tmpfs pages still active are subtracted too). The ZFS ARC counts as used:
+// it is supposed to shrink under pressure, but measured on a node filling a
+// tmpfs it stayed at 2.5 GB (its target unchanged) while free memory fell to
+// 290 MB, so counting it as available hid the pressure from eviction. Cap it
+// (vfs.zfs.arc_max) instead.
 func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
 	pagesize := uint64(unix.Getpagesize())
 	var free, inactive uint32
@@ -208,14 +212,11 @@ func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
 	if inactive, err = unix.SysctlUint32("vm.stats.vm.v_inactive_count"); err != nil {
 		return 0, 0, err
 	}
-	// No ZFS loaded: no ARC.
-	arcSize, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.size")
-	arcMin, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.c_min")
 	tmpfs, err := tmpfsUsed()
 	if err != nil {
 		return 0, 0, err
 	}
-	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, tmpfs, arcSize, arcMin)
+	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, tmpfs)
 	return workingSet, usage, nil
 }
 
@@ -250,8 +251,8 @@ func tmpfsUsed() (uint64, error) {
 }
 
 // nodeWorkingSet: usage is everything not free; the working set additionally
-// excludes inactive pages not taken by tmpfs, and the reclaimable part of the ARC.
-func nodeWorkingSet(physmem, free, inactive, tmpfs, arcSize, arcMin uint64) (workingSet, usage uint64) {
+// excludes inactive pages not taken by tmpfs.
+func nodeWorkingSet(physmem, free, inactive, tmpfs uint64) (workingSet, usage uint64) {
 	sub := func(a, b uint64) uint64 {
 		if b > a {
 			return 0
@@ -259,7 +260,7 @@ func nodeWorkingSet(physmem, free, inactive, tmpfs, arcSize, arcMin uint64) (wor
 		return a - b
 	}
 	usage = sub(physmem, free)
-	workingSet = sub(sub(usage, sub(inactive, tmpfs)), sub(arcSize, arcMin))
+	workingSet = sub(usage, sub(inactive, tmpfs))
 	return workingSet, usage
 }
 

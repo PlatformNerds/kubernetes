@@ -31,22 +31,23 @@ const mb = 1 << 20
 
 func TestNodeWorkingSet(t *testing.T) {
 	for _, tc := range []struct {
-		name                                        string
-		physmem, free, inactive, tmpfs, arc, arcMin uint64
-		wantWS, wantUsage                           uint64
+		name                           string
+		physmem, free, inactive, tmpfs uint64
+		wantWS, wantUsage              uint64
 	}{
 		// measured on a 12 GB dev VM: racct memoryuse said 790 MB
-		{"idle node", 12255 * mb, 10013 * mb, 449 * mb, 0, 842 * mb, 382 * mb, 1333 * mb, 2242 * mb},
-		{"ARC below its minimum is not reclaimable", 8192 * mb, 1024 * mb, 0, 0, 256 * mb, 512 * mb, 7168 * mb, 7168 * mb},
-		{"no ZFS", 4096 * mb, 1024 * mb, 1024 * mb, 0, 0, 0, 2048 * mb, 3072 * mb},
-		{"never negative", 1024 * mb, 512 * mb, 900 * mb, 0, 0, 0, 0, 512 * mb},
+		{"idle node", 12255 * mb, 10013 * mb, 449 * mb, 0, 1793 * mb, 2242 * mb},
+		{"never negative", 1024 * mb, 512 * mb, 900 * mb, 0, 0, 512 * mb},
 		// measured: a 6.6 GB tmpfs fill, pages moving to the inactive queue
 		// (free 326 MB); counting them as reclaimable claimed ~5 GB available
-		{"tmpfs in inactive is not reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 6656 * mb, 1100 * mb, 382 * mb, 11211 * mb, 11929 * mb},
-		{"inactive beyond tmpfs is reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 1024 * mb, 1100 * mb, 382 * mb, 7475 * mb, 11929 * mb},
+		{"tmpfs in inactive is not reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 6656 * mb, 11929 * mb, 11929 * mb},
+		{"inactive beyond tmpfs is reclaimable", 12255 * mb, 326 * mb, 4760 * mb, 1024 * mb, 8193 * mb, 11929 * mb},
+		// measured: ARC at 2.5 GB didn't shrink as free fell to 290 MB; it
+		// counts as used (it's in usage, nothing subtracts it)
+		{"ARC counts as used", 12255 * mb, 293 * mb, 0, 6917 * mb, 11962 * mb, 11962 * mb},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ws, usage := nodeWorkingSet(tc.physmem, tc.free, tc.inactive, tc.tmpfs, tc.arc, tc.arcMin)
+			ws, usage := nodeWorkingSet(tc.physmem, tc.free, tc.inactive, tc.tmpfs)
 			if ws != tc.wantWS || usage != tc.wantUsage {
 				t.Errorf("workingSet/usage = %d/%d MB, want %d/%d MB", ws/mb, usage/mb, tc.wantWS/mb, tc.wantUsage/mb)
 			}
