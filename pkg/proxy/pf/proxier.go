@@ -260,9 +260,7 @@ func CleanupLeftovers(exec utilexec.Interface) (encounteredError bool) {
 		anchor = strings.TrimSpace(anchor)
 		if strings.HasPrefix(anchor, "cni-rdr/kube-svc-") {
 			klog.V(2).Infof("deleting PF anchor %s", anchor)
-			cmd := exec.Command("pfctl", "-a", anchor, "-F", "nat")
-			err := cmd.Run()
-			if err != nil {
+			if err := flushAnchor(exec, anchor); err != nil {
 				klog.Errorf("deleting anchor %s: %v", anchor, err)
 				encounteredError = true
 			}
@@ -437,6 +435,76 @@ func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, des
 	proxier.pfData.Write(words...)
 }
 
+// writeServiceRules writes one service port's anchor: rdr for its ClusterIP
+// and NodePorts, nat for NodePort traffic to remote endpoints, and filter
+// rules for traffic the node itself sends to the ClusterIP. pf rejects a
+// ruleset whose translation rules don't all come before its filter rules,
+// so the filter rules go last.
+func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP net.IP, port, nodePort int, nodeIPs []net.IP,
+	redirHosts string, remoteIPs []string, targetPort int, sticky bool) {
+	// redirect the service ip+port and optionally also the node port address+port
+	proxier.redirectRule(af, proto, clusterIP, port, redirHosts, targetPort, sticky, "")
+	if nodePort != 0 {
+		for _, ip := range nodeIPs {
+			// Don't try to redirect ::1/128 or 127.0.0.0/8
+			if ip.IsLoopback() {
+				continue
+			}
+			proxier.redirectRule(af, proto, ip, nodePort, redirHosts, targetPort, sticky, nodePortTag)
+		}
+		// Masquerade only what goes to other nodes, to this node's
+		// own address: a single cluster-wide masquerade address
+		// (LocalModeClusterCIDR) would route replies to a node
+		// that can't reverse the NAT.
+		if len(remoteIPs) > 0 {
+			if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
+				klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", svcName)
+			} else {
+				proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(remoteIPs, ", ")+" }", targetPort)
+			}
+		}
+	}
+	proxier.hostRedirectRule(af, proto, clusterIP, port, redirHosts, targetPort)
+}
+
+// hostRedirectRule redirects traffic the node itself sends to a ClusterIP
+// (host-network pods, the kubelet, the apiserver calling webhooks): rdr rules
+// only apply to packets arriving on an interface, never to locally
+// originated ones, so these go out unredirected and fail. FreeBSD 15's pf
+// can translate on output with a filter rule's rdr-to. The rule goes in the
+// service's anchor, which the main ruleset must reference as a filter anchor
+// (anchor "cni-rdr/*"). The reply must come back to this node: its source is
+// the address of the interface the Service CIDR routes through, so on a
+// multi-homed node route the Service CIDR via the node IP's interface.
+//
+// No sticky-address: pf (15.x) records the wrong address for outbound rdr-to
+// source tracking and would redirect every later connection of a client to
+// the client itself (fixed by the bsdk8s pf patch, not yet upstream), so
+// sessionAffinity is not honoured for host-network clients.
+func (proxier *Proxier) hostRedirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int) {
+	words := []interface{}{
+		"pass out quick", af, "proto", proto,
+		"from any to", destinationIP.String(),
+		"port", strconv.Itoa(destinationPort),
+		"rdr-to", targetIPs, "port", strconv.Itoa(targetPort),
+	}
+	if strings.HasPrefix(targetIPs, "{") {
+		words = append(words, "round-robin")
+	}
+	proxier.pfData.Write(words...)
+}
+
+// flushAnchor removes all translation and filter rules of an anchor. Not
+// "-F all": that would also flush the global state table and source nodes.
+func flushAnchor(execer utilexec.Interface, anchor string) error {
+	for _, what := range []string{"nat", "rules"} {
+		if out, err := execer.Command("pfctl", "-a", anchor, "-F", what).CombinedOutput(); err != nil {
+			return fmt.Errorf("pfctl -a %s -F %s: %w: %s", anchor, what, err, out)
+		}
+	}
+	return nil
+}
+
 // nodePortSNATRule masquerades NodePort traffic that was redirected to an
 // endpoint on another node (remoteIPs) to this node's IP. Without it the
 // endpoint replies straight to the client, bypassing this node, so the rdr is
@@ -568,9 +636,8 @@ func (proxier *Proxier) syncProxyRules() error {
 		if len(targetEndpoints) == 0 {
 			// No endpoints (left): drop the rules that still redirect
 			// to the old ones.
-			cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+svcInfo.anchorName, "-F", "nat")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				klog.ErrorS(err, "Failed to flush rules of service without endpoints", "service", svcName, "output", string(out))
+			if err := flushAnchor(proxier.exec, "cni-rdr/"+svcInfo.anchorName); err != nil {
+				klog.ErrorS(err, "Failed to flush rules of service without endpoints", "service", svcName)
 			}
 			continue
 		}
@@ -597,37 +664,15 @@ func (proxier *Proxier) syncProxyRules() error {
 			proto = "sctp"
 		}
 
-		// We need to redirect the service ip+port and optionally also
-		// the node port address+port
-		proxier.pfData.Reset()
-		sticky := svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP
-		proxier.redirectRule(af, proto, svcInfo.ClusterIP(), svcInfo.Port(), redirHosts, targetPort, sticky, "")
-		if svcInfo.NodePort() != 0 {
-			for _, ip := range nodeIPs {
-				// Don't try to redirect ::1/128 or 127.0.0.0/8
-				if ip.IsLoopback() {
-					continue
-				}
-				proxier.redirectRule(af, proto, ip, svcInfo.NodePort(), redirHosts, targetPort, sticky, nodePortTag)
-			}
-			// Masquerade only what goes to other nodes, to this node's
-			// own address: a single cluster-wide masquerade address
-			// (LocalModeClusterCIDR) would route replies to a node
-			// that can't reverse the NAT.
-			remoteIPs := []string{}
-			for _, ep := range targetEndpoints {
-				if !ep.IsLocal() {
-					remoteIPs = append(remoteIPs, ep.IP())
-				}
-			}
-			if len(remoteIPs) > 0 {
-				if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
-					klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", svcName)
-				} else {
-					proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(remoteIPs, ", ")+" }", targetPort)
-				}
+		remoteIPs := []string{}
+		for _, ep := range targetEndpoints {
+			if !ep.IsLocal() {
+				remoteIPs = append(remoteIPs, ep.IP())
 			}
 		}
+		proxier.pfData.Reset()
+		proxier.writeServiceRules(svcName.String(), af, proto, svcInfo.ClusterIP(), svcInfo.Port(), svcInfo.NodePort(), nodeIPs,
+			redirHosts, remoteIPs, targetPort, svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP)
 
 		if proxier.logger.V(2).Enabled() {
 			klog.Infof("pfctl -a cni-rdr/%s -f - <EOF", svcInfo.anchorName)
@@ -648,9 +693,7 @@ func (proxier *Proxier) syncProxyRules() error {
 	proxier.killStaleUDPStates(udpFronts)
 	for a := range staleAnchors {
 		proxier.logger.V(2).Info("deleting PF anchor", a)
-		cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+a, "-F", "nat")
-		err := cmd.Run()
-		if err != nil {
+		if err := flushAnchor(proxier.exec, "cni-rdr/"+a); err != nil {
 			klog.Errorf("error flushing rules, err: %v", err)
 		}
 	}

@@ -46,30 +46,46 @@ func pfAddrPort(ip string, port int) string {
 	return fmt.Sprintf("%s:%d", ip, port)
 }
 
-// pfState is an inbound translated state from pfctl -ss, e.g.
+// pfState is a redirected state from pfctl -ss. Inbound (rdr rules, traffic
+// from pods and other nodes):
 //
 //	all udp 10.244.1.7:8081 (192.168.100.2:30081) <- 10.244.0.88:4444       MULTIPLE:MULTIPLE
 //
-// stack is the address after rdr (the endpoint), wire the address the client
-// sent to (the Service frontend), peer the client.
+// outbound (hostRedirectRule, traffic from the node itself):
+//
+//	all udp 192.168.100.2:5353 -> 10.244.0.207:53 (10.96.0.10:53)       MULTIPLE:MULTIPLE
+//
+// endpoint is the address after the redirection, frontend the address the
+// client sent to (the Service frontend), peer the client.
 type pfState struct {
-	proto, stack, wire, peer string
+	proto, endpoint, frontend, peer string
+	outbound                        bool
 }
 
-// key is the state key that pfctl -k key accepts for this state.
+// key is the state key that pfctl -k key accepts for this state: the
+// addresses as they are on the wire.
 func (s pfState) key() string {
-	return s.proto + " " + s.wire + " <- " + s.peer
+	if s.outbound {
+		return s.proto + " " + s.peer + " -> " + s.endpoint
+	}
+	return s.proto + " " + s.frontend + " <- " + s.peer
 }
 
-// parseRdrStates returns the inbound translated states in pfctl -ss output.
+func parenthesized(s string) bool {
+	return strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")")
+}
+
+// parseRdrStates returns the redirected states in pfctl -ss output.
 func parseRdrStates(out string) []pfState {
 	var states []pfState
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
-		if len(f) < 6 || f[4] != "<-" || !strings.HasPrefix(f[3], "(") || !strings.HasSuffix(f[3], ")") {
-			continue
+		switch {
+		case len(f) >= 6 && f[4] == "<-" && parenthesized(f[3]):
+			states = append(states, pfState{proto: f[1], endpoint: f[2], frontend: strings.Trim(f[3], "()"), peer: f[5]})
+		case len(f) >= 6 && f[3] == "->" && parenthesized(f[5]):
+			states = append(states, pfState{proto: f[1], peer: f[2], endpoint: f[4], frontend: strings.Trim(f[5], "()"), outbound: true})
 		}
-		states = append(states, pfState{proto: f[1], stack: f[2], wire: strings.Trim(f[3], "()"), peer: f[5]})
 	}
 	return states
 }
@@ -82,7 +98,7 @@ func staleUDPStates(states []pfState, frontends udpFrontends) []pfState {
 		if s.proto != "udp" {
 			continue
 		}
-		if endpoints, ok := frontends[s.wire]; ok && !endpoints.Has(s.stack) {
+		if endpoints, ok := frontends[s.frontend]; ok && !endpoints.Has(s.endpoint) {
 			stale = append(stale, s)
 		}
 	}
@@ -100,7 +116,7 @@ func (proxier *Proxier) killStaleUDPStates(frontends udpFrontends) {
 		return
 	}
 	for _, s := range staleUDPStates(parseRdrStates(string(out)), frontends) {
-		proxier.logger.V(2).Info("Killing stale UDP state", "state", s.key(), "endpoint", s.stack)
+		proxier.logger.V(2).Info("Killing stale UDP state", "state", s.key(), "endpoint", s.endpoint)
 		if out, err := proxier.exec.Command("pfctl", "-k", "key", "-k", s.key()).CombinedOutput(); err != nil {
 			klog.ErrorS(err, "Failed to kill stale UDP state", "state", s.key(), "output", string(out))
 		}

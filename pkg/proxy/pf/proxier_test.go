@@ -53,6 +53,42 @@ func TestRedirectRule(t *testing.T) {
 	}
 }
 
+func TestHostRedirectRule(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer()}
+	p.hostRedirectRule("inet", "udp", net.ParseIP("10.96.0.10"), 53, "{ 10.244.0.206, 10.244.0.207 }", 53)
+	p.hostRedirectRule("inet", "tcp", net.ParseIP("10.96.0.1"), 443, "{ 192.168.100.1 }", 6443)
+	want := "pass out quick inet proto udp from any to 10.96.0.10 port 53 rdr-to { 10.244.0.206, 10.244.0.207 } port 53 round-robin\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.1 port 443 rdr-to { 192.168.100.1 } port 6443 round-robin\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+// pf refuses an anchor whose translation rules (rdr, nat) don't all come
+// before its filter rules (pass): a NodePort service, with rdr and nat rules
+// for the node ports, must still put the host ClusterIP rule last.
+func TestWriteServiceRulesOrder(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
+	p.writeServiceRules("ns/svc:http", "inet", "tcp", net.ParseIP("10.96.0.20"), 80, 30080,
+		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("192.168.100.1")},
+		"{ 10.244.1.7 }", []string{"10.244.1.7"}, 8080, false)
+	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7 } port 8080 round-robin\n" +
+		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7 } port 8080 round-robin\n" +
+		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+	seenFilter := false
+	for _, l := range strings.Split(strings.TrimSpace(p.pfData.String()), "\n") {
+		isFilter := strings.HasPrefix(l, "pass") || strings.HasPrefix(l, "block") || strings.HasPrefix(l, "match")
+		if seenFilter && !isFilter {
+			t.Errorf("translation rule after a filter rule: %q", l)
+		}
+		seenFilter = seenFilter || isFilter
+	}
+}
+
 func TestNodePortSNATRule(t *testing.T) {
 	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
 	p.nodePortSNATRule("inet", "tcp", "{ 10.244.1.7 }", 8080)
@@ -71,10 +107,12 @@ all udp 10.244.1.5:53 (10.96.0.99:53) <- 10.244.0.88:4447       MULTIPLE:MULTIPL
 all udp fd00::7[53] (fd01::a[53]) <- fd00::8[4448]       MULTIPLE:MULTIPLE
 all udp 192.168.100.1:61234 (10.244.0.88:4444) -> 10.244.1.7:8081       MULTIPLE:MULTIPLE
 all udp 10.0.2.15:68 <- 10.0.2.2:67       MULTIPLE:MULTIPLE
+all udp 192.168.100.2:5353 -> 10.244.0.207:53 (10.96.0.20:81)       SINGLE:NO_TRAFFIC
+all udp 192.168.100.2:5354 -> 10.244.1.9:8082 (10.96.0.20:81)       SINGLE:NO_TRAFFIC
 `
 	states := parseRdrStates(out)
-	if len(states) != 6 {
-		t.Fatalf("parsed %d rdr states, want 6: %v", len(states), states)
+	if len(states) != 8 {
+		t.Fatalf("parsed %d rdr states, want 8: %v", len(states), states)
 	}
 	fronts := udpFrontends{
 		// endpoint 10.244.1.7 is gone: state 4444 is stale
@@ -93,6 +131,8 @@ all udp 10.0.2.15:68 <- 10.0.2.2:67       MULTIPLE:MULTIPLE
 		"udp 192.168.100.2:30081 <- 10.244.0.88:4444",
 		"udp 10.96.0.20:81 <- 10.244.0.88:4445",
 		"udp fd01::a[53] <- fd00::8[4448]",
+		// host-originated (outbound rdr-to) to a gone endpoint; 5354 is current
+		"udp 192.168.100.2:5353 -> 10.244.0.207:53",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("stale states:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
