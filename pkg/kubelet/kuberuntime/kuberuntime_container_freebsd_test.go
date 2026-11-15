@@ -125,3 +125,44 @@ func TestFreeBSDContainerResourcesRoundTrip(t *testing.T) {
 		t.Errorf("nil/empty status should convert to nil")
 	}
 }
+
+// Pod-level limits sent with the sandbox (the runtime turns them into rctl
+// rules on the pod jail): the sum of the containers' limits only when every
+// container declares one, plus overhead.
+func TestFreeBSDApplySandboxResources(t *testing.T) {
+	m := &kubeGenericRuntimeManager{cpuCFSQuota: true, cpuCFSQuotaPeriod: metav1.Duration{Duration: 100 * time.Millisecond}}
+	ctr := func(cpu, mem string) v1.Container {
+		l := v1.ResourceList{}
+		if cpu != "" {
+			l[v1.ResourceCPU] = resource.MustParse(cpu)
+		}
+		if mem != "" {
+			l[v1.ResourceMemory] = resource.MustParse(mem)
+		}
+		return v1.Container{Name: "c" + cpu + mem, Resources: v1.ResourceRequirements{Limits: l, Requests: l}}
+	}
+	for _, tc := range []struct {
+		name               string
+		pod                v1.PodSpec
+		wantMem, wantQuota int64
+	}{
+		{"all limited", v1.PodSpec{Containers: []v1.Container{ctr("200m", "128Mi"), ctr("300m", "64Mi")}}, 192 << 20, 50000},
+		{"one container without memory limit", v1.PodSpec{Containers: []v1.Container{ctr("200m", "128Mi"), ctr("300m", "")}}, 0, 50000},
+		{"with overhead", v1.PodSpec{Containers: []v1.Container{ctr("200m", "128Mi")},
+			Overhead: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("32Mi")}}, 160 << 20, 30000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &runtimeapi.PodSandboxConfig{Linux: &runtimeapi.LinuxPodSandboxConfig{}}
+			if err := m.applySandboxResources(t.Context(), &v1.Pod{Spec: tc.pod}, cfg); err != nil {
+				t.Fatal(err)
+			}
+			r := cfg.Linux.Resources
+			if r == nil {
+				t.Fatal("no resources")
+			}
+			if r.MemoryLimitInBytes != tc.wantMem || r.CpuQuota != tc.wantQuota {
+				t.Errorf("memory %d quota %d, want %d %d", r.MemoryLimitInBytes, r.CpuQuota, tc.wantMem, tc.wantQuota)
+			}
+		})
+	}
+}
