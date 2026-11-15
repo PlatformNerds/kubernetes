@@ -188,6 +188,43 @@ func getMemInfo() (int64, int64, error) {
 	return int64(physmem), pagesize * int64(total.Free), nil
 }
 
+// nodeMemory returns the node's memory working set and usage. racct's
+// memoryuse for jail 0 only sums process RSS: it leaves out the ZFS ARC, tmpfs
+// (emptyDir medium Memory), and other wired kernel memory, so the kubelet saw
+// memory as nearly free until the host ran out, and memory eviction never
+// triggered. Like Linux (usage minus inactive file pages), count what the
+// kernel can reclaim quickly as available: free and inactive pages, and the
+// part of the ARC above its minimum size.
+func nodeMemory(physmem uint64) (workingSet, usage uint64, err error) {
+	pagesize := uint64(unix.Getpagesize())
+	var free, inactive uint32
+	if free, err = unix.SysctlUint32("vm.stats.vm.v_free_count"); err != nil {
+		return 0, 0, err
+	}
+	if inactive, err = unix.SysctlUint32("vm.stats.vm.v_inactive_count"); err != nil {
+		return 0, 0, err
+	}
+	// No ZFS loaded: no ARC.
+	arcSize, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.size")
+	arcMin, _ := unix.SysctlUint64("kstat.zfs.misc.arcstats.c_min")
+	workingSet, usage = nodeWorkingSet(physmem, uint64(free)*pagesize, uint64(inactive)*pagesize, arcSize, arcMin)
+	return workingSet, usage, nil
+}
+
+// nodeWorkingSet: usage is everything not free; the working set additionally
+// excludes inactive pages and the reclaimable part of the ARC.
+func nodeWorkingSet(physmem, free, inactive, arcSize, arcMin uint64) (workingSet, usage uint64) {
+	sub := func(a, b uint64) uint64 {
+		if b > a {
+			return 0
+		}
+		return a - b
+	}
+	usage = sub(physmem, free)
+	workingSet = sub(sub(usage, inactive), sub(arcSize, arcMin))
+	return workingSet, usage
+}
+
 func createRootContainerInfo() (*cadvisorapiv2.ContainerInfo, error) {
 	// Jail id zero represents the host.
 	entries, err := getRacct("jail:0")
@@ -218,7 +255,13 @@ func createRootContainerInfo() (*cadvisorapiv2.ContainerInfo, error) {
 			},
 		}
 	}
-	if val, ok := entries["memoryuse"]; ok {
+	if ws, usage, err := nodeMemory(physmem); err == nil {
+		stats.Memory = &cadvisorapi.MemoryStats{
+			WorkingSet: ws,
+			Usage:      usage,
+		}
+	} else if val, ok := entries["memoryuse"]; ok {
+		klog.ErrorS(err, "Can't read node memory counters, falling back to process RSS (racct memoryuse)")
 		stats.Memory = &cadvisorapi.MemoryStats{
 			WorkingSet: val,
 		}
