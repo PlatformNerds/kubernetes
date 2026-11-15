@@ -28,3 +28,6 @@ import (
 func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, pod *v1.Pod, config *runtimeapi.PodSandboxConfig) error {
 	return nil
 }
+
+// sandboxCreated is called once the runtime created a pod's sandbox.
+func (m *kubeGenericRuntimeManager) sandboxCreated(_ *v1.Pod, _ *runtimeapi.PodSandboxConfig) {}

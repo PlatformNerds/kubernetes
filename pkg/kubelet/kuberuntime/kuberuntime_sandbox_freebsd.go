@@ -42,7 +42,33 @@ func (m *kubeGenericRuntimeManager) applySandboxResources(ctx context.Context, p
 	period := uint64(m.cpuCFSQuotaPeriod.Duration / time.Microsecond)
 	rc := cm.ResourceConfigForPod(pod, m.cpuCFSQuota, period, false, kubeletconfig.NoneMemoryReservationPolicy)
 	config.Linux.Resources = convertResourceConfigToLinuxContainerResources(rc)
-	// What the pod jail starts with, for in-place resize (GetPodCgroupConfig).
-	cm.RecordPodLevelConfig(pod.UID, rc)
 	return nil
+}
+
+// sandboxCreated records the pod-level limits the pod jail was created with,
+// for in-place resize (the pod container manager's GetPodCgroupConfig).
+// Only here: the sandbox config is also generated on every pod sync, from
+// the pod's desired resources.
+func (m *kubeGenericRuntimeManager) sandboxCreated(pod *v1.Pod, config *runtimeapi.PodSandboxConfig) {
+	r := config.GetLinux().GetResources()
+	if r == nil {
+		cm.RecordPodLevelConfig(pod.UID, nil)
+		return
+	}
+	rc := &cm.ResourceConfig{}
+	if r.MemoryLimitInBytes > 0 {
+		rc.Memory = &r.MemoryLimitInBytes
+	}
+	if r.CpuQuota != 0 {
+		rc.CPUQuota = &r.CpuQuota
+	}
+	if r.CpuPeriod > 0 {
+		period := uint64(r.CpuPeriod)
+		rc.CPUPeriod = &period
+	}
+	if r.CpuShares > 0 {
+		shares := uint64(r.CpuShares)
+		rc.CPUShares = &shares
+	}
+	cm.RecordPodLevelConfig(pod.UID, rc)
 }

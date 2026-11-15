@@ -392,3 +392,7 @@ func (cm *containerManagerImpl) UnprepareDynamicResources(ctx context.Context, p
 func (cm *containerManagerImpl) PodMightNeedToUnprepareResources(UID types.UID) bool {
 	return false
 }
+
+// FreeBSDPodContainerManagerForTest gives tests in other packages the FreeBSD
+// pod container manager.
+type FreeBSDPodContainerManagerForTest = podContainerManagerFreeBSD

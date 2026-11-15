@@ -71,6 +71,7 @@ func (m *kubeGenericRuntimeManager) createPodSandbox(ctx context.Context, pod *v
 		return "", message, err
 	}
 
+	m.sandboxCreated(pod, podSandboxConfig)
 	return podSandBoxID, "", nil
 }
 

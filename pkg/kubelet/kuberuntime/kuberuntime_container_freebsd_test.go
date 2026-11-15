@@ -19,6 +19,7 @@ limitations under the License.
 package kuberuntime
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
 )
 
 func TestGenerateFreeBSDContainerResources(t *testing.T) {
@@ -165,4 +167,32 @@ func TestFreeBSDApplySandboxResources(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The sandbox config is generated on every pod sync from the desired
+// resources: only a created sandbox may set what the pod container manager
+// reports as applied, or in-place pod-level resize never sees a change.
+func TestFreeBSDSandboxCreatedRecordsAppliedLimits(t *testing.T) {
+	m := &kubeGenericRuntimeManager{cpuCFSQuota: true, cpuCFSQuotaPeriod: metav1.Duration{Duration: 100 * time.Millisecond}}
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "pod-rec"}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c",
+		Resources: v1.ResourceRequirements{Limits: v1.ResourceList{v1.ResourceMemory: resource.MustParse("128Mi")}}}}}}
+	applied := func() int64 {
+		cfg, err := (&cm.FreeBSDPodContainerManagerForTest{}).GetPodCgroupConfig(pod, v1.ResourceMemory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return *cfg.Memory
+	}
+	cfg := &runtimeapi.PodSandboxConfig{Linux: &runtimeapi.LinuxPodSandboxConfig{}}
+	if err := m.applySandboxResources(t.Context(), pod, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := applied(); got != math.MaxInt64 {
+		t.Errorf("generating the sandbox config recorded %d as applied", got)
+	}
+	m.sandboxCreated(pod, cfg)
+	if got := applied(); got != 128<<20 {
+		t.Errorf("applied after sandbox creation = %d, want %d", got, 128<<20)
+	}
+	cm.RecordPodLevelConfig(pod.UID, nil)
 }
