@@ -24,6 +24,7 @@ package cm
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
@@ -37,6 +38,7 @@ import (
 	internalapi "k8s.io/cri-api/pkg/apis"
 	pluginwatcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
+	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
@@ -199,16 +201,43 @@ func (cm *containerManagerImpl) NewPodContainerManager() PodContainerManager {
 }
 
 // podContainerManagerFreeBSD: FreeBSD has no pod cgroup. Container limits are
-// rctl rules on each container's jail (set by the runtime), so for in-place
-// resize the pod-level config is reported as unknown (nil, like the Linux
-// no-op manager without cgroups-per-QOS) and setting it is a no-op; the
-// kubelet then resizes the containers through UpdateContainerResources.
+// rctl rules on each container's jail (set by the runtime) and nothing
+// enforces pod-level limits, so for in-place resize the pod's current
+// pod-level config is reported as what its allocated resources imply (no
+// limit: unlimited memory, quota -1, like an unlimited cgroup), and setting it
+// is a no-op. The kubelet then sees no pod-level change to make and resizes
+// the containers through UpdateContainerResources. (The resize code
+// dereferences these values, so they must not be nil.)
 type podContainerManagerFreeBSD struct {
 	podContainerManagerStub
 }
 
-func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(_ *v1.Pod, _ v1.ResourceName) (*ResourceConfig, error) {
-	return nil, nil
+func (m *podContainerManagerFreeBSD) GetPodCgroupConfig(pod *v1.Pod, resourceName v1.ResourceName) (*ResourceConfig, error) {
+	rc := ResourceConfigForPod(pod, true, QuotaPeriod, false, kubeletconfig.NoneMemoryReservationPolicy)
+	if rc == nil {
+		rc = &ResourceConfig{}
+	}
+	switch resourceName {
+	case v1.ResourceMemory:
+		memory := int64(math.MaxInt64)
+		if rc.Memory != nil {
+			memory = *rc.Memory
+		}
+		return &ResourceConfig{Memory: &memory}, nil
+	case v1.ResourceCPU:
+		quota, period, shares := int64(-1), uint64(QuotaPeriod), uint64(MinShares)
+		if rc.CPUQuota != nil {
+			quota = *rc.CPUQuota
+		}
+		if rc.CPUPeriod != nil {
+			period = *rc.CPUPeriod
+		}
+		if rc.CPUShares != nil {
+			shares = *rc.CPUShares
+		}
+		return &ResourceConfig{CPUQuota: &quota, CPUPeriod: &period, CPUShares: &shares}, nil
+	}
+	return nil, fmt.Errorf("unsupported pod resource %q", resourceName)
 }
 
 func (m *podContainerManagerFreeBSD) SetPodCgroupConfig(_ klog.Logger, _ *v1.Pod, _ *ResourceConfig) error {
