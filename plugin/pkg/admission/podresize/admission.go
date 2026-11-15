@@ -146,8 +146,8 @@ func (p *Plugin) validatePodResize(pod *core.Pod, a admission.Attributes) error 
 		return admission.NewForbidden(a, fmt.Errorf("failed to get node %q: %w", pod.Spec.NodeName, err))
 	}
 
-	// If the node is not a linux node, reject the update.
-	if err := validateLinuxNode(node); err != nil {
+	// If the node's OS doesn't support in-place resize, reject the update.
+	if err := validateResizeSupportedNode(node); err != nil {
 		return resizeValidationError(a, err, ReasonUnsupportedPlatform)
 	}
 
@@ -169,14 +169,16 @@ func validateNodeAllocatable(pod *core.Pod, node *corev1.Node) error {
 	return validateRequestsWithinAllocatable(podV1, node.Status.Allocatable)
 }
 
-// Returns nil if the node is a linux node, err otherwise.
-func validateLinuxNode(node *corev1.Node) error {
+// Returns nil if the node's OS supports in-place pod resize, err otherwise.
+// Linux resizes cgroups; FreeBSD changes the rctl(8) limits on the
+// container's jail (container-level resize only).
+func validateResizeSupportedNode(node *corev1.Node) error {
 	// This label should always be populated.
 	val, ok := node.Labels[corev1.LabelOSStable]
-	if !ok || val == "linux" {
+	if !ok || val == "linux" || val == "freebsd" {
 		return nil
 	}
-	return fmt.Errorf("pod resize is only supported on linux nodes, node %q is %q", node.Name, val)
+	return fmt.Errorf("pod resize is only supported on linux and freebsd nodes, node %q is %q", node.Name, val)
 }
 
 func resizeValidationError(a admission.Attributes, err error, reason metav1.CauseType) error {

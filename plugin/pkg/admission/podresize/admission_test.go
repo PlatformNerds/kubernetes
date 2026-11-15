@@ -64,6 +64,10 @@ func TestResizeAdmission(t *testing.T) {
 		},
 	}
 
+	freebsdNode := linuxNode.DeepCopy()
+	freebsdNode.Name = "freebsd-node"
+	freebsdNode.Labels[corev1.LabelOSStable] = "freebsd"
+
 	testPod := &core.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test-pod",
@@ -225,7 +229,25 @@ func TestResizeAdmission(t *testing.T) {
 				return p
 			},
 			expectErr:   true,
-			errContains: "pod resize is only supported on linux nodes",
+			errContains: "pod resize is only supported on linux and freebsd nodes",
+		},
+		{
+			name:        "Allow resize on FreeBSD node",
+			subresource: "resize",
+			nodeName:    "freebsd-node",
+			oldPod: func() *core.Pod {
+				p := testPod.DeepCopy()
+				p.Spec.NodeName = "freebsd-node"
+				return p
+			}(),
+			newPod: func() *core.Pod {
+				p := testPod.DeepCopy()
+				p.Spec.NodeName = "freebsd-node"
+				p.Generation = 2
+				p.Spec.Containers[0].Resources.Requests[core.ResourceCPU] = resource.MustParse("2")
+				return p
+			},
+			expectErr: false,
 		},
 		{
 			name:        "Reject if node not found",
@@ -249,7 +271,7 @@ func TestResizeAdmission(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := fake.NewClientset(linuxNode, windowsNode)
+			client := fake.NewClientset(linuxNode, windowsNode, freebsdNode)
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 
 			plugin, err := NewPlugin()

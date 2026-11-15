@@ -1716,7 +1716,7 @@ func TestPodResizeValidation(t *testing.T) {
 			name:            "fail resize on non-linux node",
 			targetNode:      "windows-node",
 			resizeCPU:       "1",
-			expectError:     "pod resize is only supported on linux nodes",
+			expectError:     "pod resize is only supported on linux and freebsd nodes",
 			expectCauseType: "UnsupportedPlatform",
 		},
 	}
