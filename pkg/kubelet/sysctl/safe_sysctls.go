@@ -32,6 +32,17 @@ type sysctl struct {
 	kernel string
 }
 
+// freebsdSafeSysctls are the safe sysctls a FreeBSD runtime can scope to a
+// pod: ocijail maps them onto per-vnet sysctls of the pod's own vnet jail
+// (ip_unprivileged_port_start -> net.inet.ip.portrange.reservedhigh,
+// ip_local_port_range -> net.inet.ip.portrange.first/last). The other Linux
+// safe sysctls have no per-pod FreeBSD equivalent, and allowing them would
+// let pods ask for settings that are silently ignored.
+var freebsdSafeSysctls = []string{
+	"net.ipv4.ip_local_port_range",
+	"net.ipv4.ip_unprivileged_port_start",
+}
+
 var safeSysctls = []sysctl{
 	{
 		name: "kernel.shm_rmid_forced",
@@ -77,6 +88,9 @@ var safeSysctls = []sysctl{
 // - it is namespaced in the container or the pod
 // - it is isolated, i.e. has no influence on any other pod on the same node.
 func SafeSysctlAllowlist(ctx context.Context) []string {
+	if goruntime.GOOS == "freebsd" {
+		return freebsdSafeSysctls
+	}
 	if goruntime.GOOS != "linux" {
 		return nil
 	}
