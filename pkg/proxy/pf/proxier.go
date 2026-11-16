@@ -441,9 +441,15 @@ func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, des
 // ruleset whose translation rules don't all come before its filter rules,
 // so the filter rules go last.
 func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP net.IP, port, nodePort int, nodeIPs []net.IP,
-	redirHosts string, remoteIPs []string, targetPort int, sticky bool) {
+	redirHosts string, remoteIPs, localIPs []string, targetPort int, sticky bool) {
 	// redirect the service ip+port and optionally also the node port address+port
 	proxier.redirectRule(af, proto, clusterIP, port, redirHosts, targetPort, sticky, "")
+	// hairpin: a local endpoint redirected to itself
+	if proxier.nodeIP != nil && !proxier.nodeIP.IsUnspecified() {
+		for _, ip := range localIPs {
+			proxier.hairpinSNATRule(af, proto, ip, targetPort)
+		}
+	}
 	if nodePort != 0 {
 		for _, ip := range nodeIPs {
 			// Don't try to redirect ::1/128 or 127.0.0.0/8
@@ -473,6 +479,23 @@ func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP n
 			proxier.hostNodePortRule(af, proto, ip, nodePort, redirHosts, targetPort)
 		}
 	}
+}
+
+// hairpinSNATRule masquerades a pod's connection to a Service that was
+// redirected to the pod itself. Without it the pod answers itself directly
+// inside its own network stack, the reply never passes this node, the rdr is
+// never reversed, and the client sees a reply from its own address instead
+// of the Service's, so the connection fails (every time round-robin picks the
+// client). Linux kube-proxy masquerades hairpin traffic the same way. With
+// the node IP as source, the reply comes back through the node, which
+// reverses both translations.
+func (proxier *Proxier) hairpinSNATRule(af, proto string, endpointIP string, targetPort int) {
+	proxier.pfData.Write(
+		"nat", af, "proto", proto,
+		"from", endpointIP, "to", endpointIP,
+		"port", strconv.Itoa(targetPort),
+		"->", proxier.nodeIP.String(),
+	)
 }
 
 // hostNodePortRule redirects the node's own connections to one of its
@@ -693,15 +716,17 @@ func (proxier *Proxier) syncProxyRules() error {
 			proto = "sctp"
 		}
 
-		remoteIPs := []string{}
+		remoteIPs, localIPs := []string{}, []string{}
 		for _, ep := range targetEndpoints {
-			if !ep.IsLocal() {
+			if ep.IsLocal() {
+				localIPs = append(localIPs, ep.IP())
+			} else {
 				remoteIPs = append(remoteIPs, ep.IP())
 			}
 		}
 		proxier.pfData.Reset()
 		proxier.writeServiceRules(svcName.String(), af, proto, svcInfo.ClusterIP(), svcInfo.Port(), svcInfo.NodePort(), nodeIPs,
-			redirHosts, remoteIPs, targetPort, svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP)
+			redirHosts, remoteIPs, localIPs, targetPort, svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP)
 
 		if proxier.logger.V(2).Enabled() {
 			klog.Infof("pfctl -a cni-rdr/%s -f - <EOF", svcInfo.anchorName)

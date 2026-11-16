@@ -71,12 +71,13 @@ func TestWriteServiceRulesOrder(t *testing.T) {
 	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
 	p.writeServiceRules("ns/svc:http", "inet", "tcp", net.ParseIP("10.96.0.20"), 80, 30080,
 		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("192.168.100.1")},
-		"{ 10.244.1.7 }", []string{"10.244.1.7"}, 8080, false)
-	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7 } port 8080 round-robin\n" +
-		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7 } port 8080 round-robin\n" +
+		"{ 10.244.1.7, 10.244.0.5 }", []string{"10.244.1.7"}, []string{"10.244.0.5"}, 8080, false)
+	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
+		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
 		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
-		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7 } port 8080 round-robin\n" +
-		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n"
 	if got := p.pfData.String(); got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}
