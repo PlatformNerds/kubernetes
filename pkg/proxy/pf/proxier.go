@@ -465,6 +465,35 @@ func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP n
 		}
 	}
 	proxier.hostRedirectRule(af, proto, clusterIP, port, redirHosts, targetPort)
+	if nodePort != 0 {
+		for _, ip := range nodeIPs {
+			if ip.IsLoopback() {
+				continue
+			}
+			proxier.hostNodePortRule(af, proto, ip, nodePort, redirHosts, targetPort)
+		}
+	}
+}
+
+// hostNodePortRule redirects the node's own connections to one of its
+// NodePorts. Those go out through lo0 and back in, where the NodePort rdr
+// rule matches but the redirected packet isn't forwarded off lo0, so they
+// are redirected on the way out instead. The replies then come back with the
+// node's own address as source on the endpoint's interface, which source
+// address validation drops unless pf delivers them (the bsdk8s pf change
+// "deliver replies of redirected connections to the host's own address");
+// on other kernels this rule is harmless: such connections failed anyway.
+func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, targetIPs string, targetPort int) {
+	words := []interface{}{
+		"pass out quick on lo0", af, "proto", proto,
+		"from any to", nodeIP.String(),
+		"port", strconv.Itoa(nodePort),
+		"rdr-to", targetIPs, "port", strconv.Itoa(targetPort),
+	}
+	if strings.HasPrefix(targetIPs, "{") {
+		words = append(words, "round-robin")
+	}
+	proxier.pfData.Write(words...)
 }
 
 // hostRedirectRule redirects traffic the node itself sends to a ClusterIP
