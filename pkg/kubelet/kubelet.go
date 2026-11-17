@@ -1115,7 +1115,11 @@ func NewMainKubelet(ctx context.Context,
 	handlers = append(handlers, klet.containerManager.GetAllocateResourcesPodAdmitHandler())
 
 	criticalPodAdmissionHandler := preemption.NewCriticalPodAdmissionHandler(klet.getAllocatedPods, killPodNow(ctx, klet.podWorkers, kubeDeps.Recorder), kubeDeps.Recorder)
-	handlers = append(handlers, lifecycle.NewPredicateAdmitHandler(klet.GetCachedNode, criticalPodAdmissionHandler, klet.containerManager.UpdatePluginResources))
+	var predicateOpts []lifecycle.PredicateAdmitOption
+	if klet.runtimeClassManager != nil {
+		predicateOpts = append(predicateOpts, lifecycle.WithRuntimeClassPodOS(klet.runtimeClassManager.LookupPodOS))
+	}
+	handlers = append(handlers, lifecycle.NewPredicateAdmitHandler(klet.GetCachedNode, criticalPodAdmissionHandler, klet.containerManager.UpdatePluginResources, predicateOpts...))
 	// apply functional Option's
 	for _, opt := range kubeDeps.Options {
 		opt(klet)

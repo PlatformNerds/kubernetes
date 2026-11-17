@@ -25,6 +25,12 @@ import (
 	nodev1 "k8s.io/client-go/listers/node/v1"
 )
 
+// PodOSAnnotation on a RuntimeClass names the pod OS (spec.os.name) its
+// handler runs when that differs from the node OS, e.g. "linux" for a Linux
+// ABI runtime on FreeBSD. The kubelet admits pods of that OS only with that
+// RuntimeClass.
+const PodOSAnnotation = "bsdk8s.io/pod-os"
+
 // Manager caches RuntimeClass API objects, and provides accessors to the Kubelet.
 type Manager struct {
 	informerFactory informers.SharedInformerFactory
@@ -75,4 +81,19 @@ func (m *Manager) LookupRuntimeHandler(runtimeClassName *string) (string, error)
 	}
 
 	return rc.Handler, nil
+}
+
+// LookupPodOS returns the pod OS declared by the RuntimeClass's
+// PodOSAnnotation, or "" if it has none or cannot be found.
+func (m *Manager) LookupPodOS(runtimeClassName *string) string {
+	if runtimeClassName == nil || *runtimeClassName == "" {
+		return ""
+	}
+
+	rc, err := m.lister.Get(*runtimeClassName)
+	if err != nil {
+		return ""
+	}
+
+	return rc.Annotations[PodOSAnnotation]
 }

@@ -102,18 +102,40 @@ type predicateAdmitHandler struct {
 	getNodeAnyWayFunc        getNodeAnyWayFuncType
 	pluginResourceUpdateFunc pluginResourceUpdateFuncType
 	admissionFailureHandler  AdmissionFailureHandler
+	runtimeClassPodOS        RuntimeClassPodOSFunc
 }
 
 var _ PodAdmitHandler = &predicateAdmitHandler{}
 
+// RuntimeClassPodOSFunc returns the pod OS that the named RuntimeClass runs,
+// or "" if the RuntimeClass does not declare one.
+type RuntimeClassPodOSFunc func(runtimeClassName *string) string
+
+// PredicateAdmitOption configures the handler returned by NewPredicateAdmitHandler.
+type PredicateAdmitOption func(*predicateAdmitHandler)
+
+// WithRuntimeClassPodOS admits a pod whose spec.os differs from the node OS
+// when the pod's RuntimeClass declares that it runs pods of that OS, for
+// example a Linux ABI runtime on a FreeBSD node.
+func WithRuntimeClassPodOS(f RuntimeClassPodOSFunc) PredicateAdmitOption {
+	return func(w *predicateAdmitHandler) {
+		w.runtimeClassPodOS = f
+	}
+}
+
 // NewPredicateAdmitHandler returns a PodAdmitHandler which is used to evaluates
 // if a pod can be admitted from the perspective of predicates.
-func NewPredicateAdmitHandler(getNodeAnyWayFunc getNodeAnyWayFuncType, admissionFailureHandler AdmissionFailureHandler, pluginResourceUpdateFunc pluginResourceUpdateFuncType) PodAdmitHandler {
-	return &predicateAdmitHandler{
-		getNodeAnyWayFunc,
-		pluginResourceUpdateFunc,
-		admissionFailureHandler,
+func NewPredicateAdmitHandler(getNodeAnyWayFunc getNodeAnyWayFuncType, admissionFailureHandler AdmissionFailureHandler, pluginResourceUpdateFunc pluginResourceUpdateFuncType, opts ...PredicateAdmitOption) PodAdmitHandler {
+	w := &predicateAdmitHandler{
+		getNodeAnyWayFunc:        getNodeAnyWayFunc,
+		pluginResourceUpdateFunc: pluginResourceUpdateFunc,
+		admissionFailureHandler:  admissionFailureHandler,
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+
+	return w
 }
 
 func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult {
@@ -140,7 +162,7 @@ func (w *predicateAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult 
 			Message: "Failed to admit pod as the `kubernetes.io/os` label doesn't match node label",
 		}
 	}
-	if rejectPodAdmissionBasedOnOSField(admitPod) {
+	if rejectPodAdmissionBasedOnOSField(admitPod, w.runtimeClassPodOS) {
 		return PodAdmitResult{
 			Admit:   false,
 			Reason:  PodOSNotSupported,
@@ -296,15 +318,22 @@ func rejectPodAdmissionBasedOnOSSelector(pod *v1.Pod, node *v1.Node) bool {
 	return false
 }
 
-// rejectPodAdmissionBasedOnOSField rejects pods if their OS field doesn't match runtime.GOOS.
+// rejectPodAdmissionBasedOnOSField rejects pods if their OS field doesn't match runtime.GOOS,
+// unless the pod's RuntimeClass declares that it runs pods of that OS (runtimeClassPodOS).
 // TODO: Relax this restriction when we start supporting LCOW in kubernetes where podOS may not match
 // node's OS.
-func rejectPodAdmissionBasedOnOSField(pod *v1.Pod) bool {
+func rejectPodAdmissionBasedOnOSField(pod *v1.Pod, runtimeClassPodOS RuntimeClassPodOSFunc) bool {
 	if pod.Spec.OS == nil {
 		return false
 	}
-	// If the pod OS doesn't match runtime.GOOS return false
-	return string(pod.Spec.OS.Name) != runtime.GOOS
+	if string(pod.Spec.OS.Name) == runtime.GOOS {
+		return false
+	}
+	if runtimeClassPodOS != nil && pod.Spec.RuntimeClassName != nil &&
+		runtimeClassPodOS(pod.Spec.RuntimeClassName) == string(pod.Spec.OS.Name) {
+		return false
+	}
+	return true
 }
 
 // rejectPodAdmissionBasedOnSupplementalGroupsPolicy rejects pod only if

@@ -694,11 +694,43 @@ func TestRejectPodAdmissionBasedOnOSSelector(t *testing.T) {
 }
 
 func TestRejectPodAdmissionBasedOnOSField(t *testing.T) {
+	linuxABI := "linux-abi"
+	native := "native"
+	runtimeClassPodOS := func(name *string) string {
+		if name != nil && *name == linuxABI {
+			return "dummyOS"
+		}
+		return ""
+	}
 	tests := []struct {
-		name            string
-		pod             *v1.Pod
-		expectRejection bool
+		name              string
+		pod               *v1.Pod
+		runtimeClassPodOS RuntimeClassPodOSFunc
+		expectRejection   bool
 	}{
+		{
+			name:              "OS field mismatch, RuntimeClass declares that OS",
+			pod:               &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}, RuntimeClassName: &linuxABI}},
+			runtimeClassPodOS: runtimeClassPodOS,
+			expectRejection:   false,
+		},
+		{
+			name:              "OS field mismatch, RuntimeClass declares no OS",
+			pod:               &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}, RuntimeClassName: &native}},
+			runtimeClassPodOS: runtimeClassPodOS,
+			expectRejection:   true,
+		},
+		{
+			name:              "OS field mismatch, no RuntimeClass",
+			pod:               &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}}},
+			runtimeClassPodOS: runtimeClassPodOS,
+			expectRejection:   true,
+		},
+		{
+			name:            "OS field mismatch, RuntimeClass but no lookup",
+			pod:             &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: "dummyOS"}, RuntimeClassName: &linuxABI}},
+			expectRejection: true,
+		},
 		{
 			name:            "OS field match",
 			pod:             &v1.Pod{Spec: v1.PodSpec{OS: &v1.PodOS{Name: v1.OSName(goruntime.GOOS)}}},
@@ -717,7 +749,7 @@ func TestRejectPodAdmissionBasedOnOSField(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			actualResult := rejectPodAdmissionBasedOnOSField(test.pod)
+			actualResult := rejectPodAdmissionBasedOnOSField(test.pod, test.runtimeClassPodOS)
 			if test.expectRejection != actualResult {
 				t.Errorf("unexpected result, expected %v but got %v", test.expectRejection, actualResult)
 			}
