@@ -55,8 +55,8 @@ func TestRedirectRule(t *testing.T) {
 
 func TestHostRedirectRule(t *testing.T) {
 	p := &Proxier{pfData: proxyutil.NewLineBuffer()}
-	p.hostRedirectRule("inet", "udp", net.ParseIP("10.96.0.10"), 53, "{ 10.244.0.206, 10.244.0.207 }", 53)
-	p.hostRedirectRule("inet", "tcp", net.ParseIP("10.96.0.1"), 443, "{ 192.168.100.1 }", 6443)
+	p.hostRedirectRule("inet", "udp", "any", net.ParseIP("10.96.0.10"), 53, "{ 10.244.0.206, 10.244.0.207 }", 53)
+	p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.1"), 443, "{ 192.168.100.1 }", 6443)
 	want := "pass out quick inet proto udp from any to 10.96.0.10 port 53 rdr-to { 10.244.0.206, 10.244.0.207 } port 53 round-robin\n" +
 		"pass out quick inet proto tcp from any to 10.96.0.1 port 443 rdr-to { 192.168.100.1 } port 6443 round-robin\n"
 	if got := p.pfData.String(); got != want {
@@ -224,4 +224,53 @@ func TestWriteServiceRulesExternalIPs(t *testing.T) {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}
 	checkOrder(t, p.pfData.String())
+}
+
+// A LoadBalancer IP with loadBalancerSourceRanges: other sources, the node's
+// own connections included, are not redirected and are dropped. The externalIP
+// isn't filtered, as on Linux.
+func TestWriteServiceRulesLBSourceRanges(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
+	all := target([]string{"10.244.0.5"}, nil, 8080)
+	p.writeServiceRules(&serviceRules{name: "ns/svc:http", af: "inet", proto: "tcp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 80,
+		externalIPs:    []net.IP{net.ParseIP("192.168.100.200")},
+		lbIPs:          []net.IP{net.ParseIP("192.168.100.201")},
+		lbSourceRanges: []string{"203.0.113.0/24"},
+		internal:       all, external: all})
+	want := "table <lb_src> const { 203.0.113.0/24 }\n" +
+		"rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
+		"rdr inet proto tcp from any to 192.168.100.200 port 80 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"no rdr inet proto tcp from ! <lb_src> to 192.168.100.201 port 80\n" +
+		"rdr inet proto tcp from any to 192.168.100.201 port 80 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick inet proto tcp from any to 192.168.100.200 port 80 rdr-to { 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick inet proto tcp from <lb_src> to 192.168.100.201 port 80 rdr-to { 10.244.0.5 } port 8080 round-robin\n" +
+		"block drop in quick inet proto tcp from any to 192.168.100.201 port 80\n" +
+		"block drop out quick inet proto tcp from any to 192.168.100.201 port 80\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+	checkOrder(t, p.pfData.String())
+}
+
+func TestLBSourceRanges(t *testing.T) {
+	_, a, _ := net.ParseCIDR("203.0.113.0/24")
+	_, b, _ := net.ParseCIDR("192.168.100.0/24")
+	lb := []net.IP{net.ParseIP("192.168.100.201")}
+	node := net.ParseIP("192.168.100.1")
+	for _, tc := range []struct {
+		ranges []*net.IPNet
+		want   string
+	}{
+		{nil, ""},
+		{[]*net.IPNet{a}, "203.0.113.0/24"},
+		// a range holds the node IP: the LB IP is allowed too
+		{[]*net.IPNet{a, b}, "203.0.113.0/24 192.168.100.0/24 192.168.100.201"},
+	} {
+		if got := strings.Join(lbSourceRanges(tc.ranges, node, lb), " "); got != tc.want {
+			t.Errorf("lbSourceRanges(%v) = %q, want %q", tc.ranges, got, tc.want)
+		}
+	}
 }

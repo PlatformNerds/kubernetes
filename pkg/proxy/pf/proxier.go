@@ -491,8 +491,12 @@ type serviceRules struct {
 	clusterIP       net.IP
 	port, nodePort  int
 	nodeIPs         []net.IP
-	externalIPs     []net.IP // externalIPs and LoadBalancer ingress IPs
-	sticky          bool
+	externalIPs     []net.IP
+	lbIPs           []net.IP // LoadBalancer ingress IPs
+	// lbSourceRanges, if set, are the only sources allowed to reach
+	// the LoadBalancer IPs (loadBalancerSourceRanges).
+	lbSourceRanges []string
+	sticky         bool
 
 	// internal is where ClusterIP traffic goes (internalTrafficPolicy).
 	internal *pfTarget
@@ -513,6 +517,13 @@ type serviceRules struct {
 // filter rules, so the filter rules go last.
 func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	af, proto := r.af, r.proto
+	dests := r.externalDestinations()
+	for _, d := range dests {
+		if d.firewalled {
+			proxier.pfData.Write("table", lbSourceTable, "const", "{", strings.Join(r.lbSourceRanges, ", "), "}")
+			break
+		}
+	}
 	if r.internal != nil {
 		proxier.redirectRule(af, proto, "any", r.clusterIP, r.port, r.internal.hosts, r.internal.port, r.sticky, "")
 	}
@@ -537,7 +548,6 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	if r.externalLocal && r.shortCircuit != nil {
 		nodeTarget = r.shortCircuit
 	}
-	dests := r.externalDestinations()
 	if len(dests) > 0 {
 		// So do this node's pods'. Without a local traffic detector
 		// they are treated as external, as on Linux.
@@ -547,6 +557,12 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 			podSource = proxier.localDetector.IfLocal()
 		}
 		for _, d := range dests {
+			if d.firewalled {
+				// loadBalancerSourceRanges: other sources stay
+				// untranslated and are dropped below.
+				proxier.pfData.Write("no rdr", af, "proto", proto, "from !", lbSourceTable,
+					"to", d.ip.String(), "port", strconv.Itoa(d.port))
+			}
 			if podSource != "" {
 				proxier.redirectRule(af, proto, podSource, d.ip, d.port, r.shortCircuit.hosts, r.shortCircuit.port, r.sticky, nodePortTag)
 			}
@@ -578,31 +594,47 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 		}
 	}
 	if r.internal != nil {
-		proxier.hostRedirectRule(af, proto, r.clusterIP, r.port, r.internal.hosts, r.internal.port)
+		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal.hosts, r.internal.port)
 	}
 	for _, d := range dests {
 		if nodeTarget != nil {
 			if d.isNodePort {
 				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget.hosts, nodeTarget.port)
 			} else {
-				proxier.hostRedirectRule(af, proto, d.ip, d.port, nodeTarget.hosts, nodeTarget.port)
+				source := "any"
+				if d.firewalled {
+					source = lbSourceTable
+				}
+				proxier.hostRedirectRule(af, proto, source, d.ip, d.port, nodeTarget.hosts, nodeTarget.port)
 			}
 		}
-		if r.external == nil {
-			// externalTrafficPolicy: Local and no local
-			// endpoint: drop, so that a load balancer's
-			// health check sends clients elsewhere.
+		// externalTrafficPolicy: Local and no local endpoint: drop,
+		// so that a load balancer's health check sends clients
+		// elsewhere. With loadBalancerSourceRanges, drop what the
+		// source ranges kept from being redirected, including the
+		// node's own connections, as on Linux.
+		if r.external == nil || d.firewalled {
 			proxier.pfData.Write("block drop in quick", af, "proto", proto,
+				"from any to", d.ip.String(), "port", strconv.Itoa(d.port))
+		}
+		if d.firewalled {
+			proxier.pfData.Write("block drop out quick", af, "proto", proto,
 				"from any to", d.ip.String(), "port", strconv.Itoa(d.port))
 		}
 	}
 }
+
+// lbSourceTable is the anchor table of sources allowed to reach a Service's
+// LoadBalancer IPs.
+const lbSourceTable = "<lb_src>"
 
 // externalDestination is an address and port that takes external traffic.
 type externalDestination struct {
 	ip         net.IP
 	port       int
 	isNodePort bool
+	// firewalled: only sources in lbSourceTable may reach it.
+	firewalled bool
 }
 
 // externalDestinations returns the node IPs with the NodePort, then the
@@ -613,14 +645,39 @@ func (r *serviceRules) externalDestinations() []externalDestination {
 		for _, ip := range r.nodeIPs {
 			// Don't try to redirect ::1/128 or 127.0.0.0/8
 			if !ip.IsLoopback() {
-				d = append(d, externalDestination{ip, r.nodePort, true})
+				d = append(d, externalDestination{ip: ip, port: r.nodePort, isNodePort: true})
 			}
 		}
 	}
 	for _, ip := range r.externalIPs {
-		d = append(d, externalDestination{ip, r.port, false})
+		d = append(d, externalDestination{ip: ip, port: r.port})
+	}
+	for _, ip := range r.lbIPs {
+		d = append(d, externalDestination{ip: ip, port: r.port, firewalled: len(r.lbSourceRanges) > 0})
 	}
 	return d
+}
+
+// lbSourceRanges returns the sources allowed to reach a Service's
+// LoadBalancer IPs, as in the iptables proxier: the source ranges and, when
+// one of them holds the node IP, the LoadBalancer IPs themselves (a VIP that
+// is a local address loops the node's own connections back with the VIP as
+// source). Empty means any source.
+func lbSourceRanges(ranges []*net.IPNet, nodeIP net.IP, lbIPs []net.IP) []string {
+	var s []string
+	allowFromNode := false
+	for _, cidr := range ranges {
+		s = append(s, cidr.String())
+		if nodeIP != nil && cidr.Contains(nodeIP) {
+			allowFromNode = true
+		}
+	}
+	if allowFromNode {
+		for _, ip := range lbIPs {
+			s = append(s, ip.String())
+		}
+	}
+	return s
 }
 
 // hairpinSNATRule masquerades a pod's connection to a Service that was
@@ -675,10 +732,10 @@ func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePo
 // source tracking and would redirect every later connection of a client to
 // the client itself (fixed by the bsdk8s pf patch, not yet upstream), so
 // sessionAffinity is not honoured for host-network clients.
-func (proxier *Proxier) hostRedirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int) {
+func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int) {
 	words := []interface{}{
 		"pass out quick", af, "proto", proto,
-		"from any to", destinationIP.String(),
+		"from", source, "to", destinationIP.String(),
 		"port", strconv.Itoa(destinationPort),
 		"rdr-to", targetIPs, "port", strconv.Itoa(targetPort),
 	}
@@ -830,7 +887,11 @@ func (proxier *Proxier) syncProxyRules() error {
 		}
 		// externalIPs and LoadBalancer ingress IPs (MetalLB and the
 		// like) take external traffic on the service port.
-		rules.externalIPs = append(append(rules.externalIPs, svcInfo.ExternalIPs()...), svcInfo.LoadBalancerVIPs()...)
+		rules.externalIPs = svcInfo.ExternalIPs()
+		rules.lbIPs = svcInfo.LoadBalancerVIPs()
+		if len(rules.lbIPs) > 0 {
+			rules.lbSourceRanges = lbSourceRanges(svcInfo.LoadBalancerSourceRanges(), proxier.nodeIP, rules.lbIPs)
+		}
 		if svcInfo.ExternallyAccessible() {
 			rules.external = newPFTarget(externalEndpoints)
 			rules.externalLocal = svcInfo.ExternalPolicyLocal()
