@@ -82,8 +82,59 @@ func (cc *cadvisorClient) ContainerInfoV2(name string, options cadvisorapiv2.Req
 	return infos, nil
 }
 
+// VersionInfo reports what cadvisor reports on Linux: the kernel release
+// (uname -r) and the PRETTY_NAME of os-release(5).
 func (cc *cadvisorClient) VersionInfo() (*cadvisorapi.VersionInfo, error) {
-	return &cadvisorapi.VersionInfo{}, nil
+	release, err := unix.Sysctl("kern.osrelease")
+	if err != nil {
+		return nil, err
+	}
+	return &cadvisorapi.VersionInfo{
+		KernelVersion:      release,
+		ContainerOsVersion: osPrettyName("/etc/os-release", "FreeBSD "+release),
+	}, nil
+}
+
+// osPrettyName returns PRETTY_NAME from an os-release(5) file, or def.
+func osPrettyName(path, def string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return def
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		v, ok := strings.CutPrefix(strings.TrimSpace(line), "PRETTY_NAME=")
+		if !ok {
+			continue
+		}
+		if u, err := strconv.Unquote(v); err == nil {
+			v = u
+		}
+		if v != "" {
+			return v
+		}
+	}
+	return def
+}
+
+// bootID formats kern.boot_id, 16 random bytes chosen once per boot, as a
+// UUID like Linux's /proc/sys/kernel/random/boot_id.  The kubelet records a
+// Rebooted event when it changes.
+func bootID() string {
+	b, err := unix.SysctlRaw("kern.boot_id")
+	if err != nil || len(b) != 16 {
+		return ""
+	}
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// machineID returns the contents of /etc/machine-id, which FreeBSD writes
+// from the host UUID, or the host name if there is none.
+func machineID(hostname string) string {
+	data, err := os.ReadFile("/etc/machine-id")
+	if id := strings.TrimSpace(string(data)); err == nil && id != "" {
+		return id
+	}
+	return hostname
 }
 
 func (cc *cadvisorClient) SubcontainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (map[string]*cadvisorapi.ContainerInfo, error) {
@@ -111,12 +162,17 @@ func (cc *cadvisorClient) MachineInfo() (*cadvisorapi.MachineInfo, error) {
 		return nil, err
 	}
 
+	// The SMBIOS system UUID, or the UUID FreeBSD generated if there is none.
+	systemUUID, _ := unix.Sysctl("kern.hostuuid")
+
 	return &cadvisorapi.MachineInfo{
 		NumCores:         int(cores),
 		NumPhysicalCores: int(physCores),
 		NumSockets:       1,
 		MemoryCapacity:   uint64(memTotal),
-		MachineID:        hostname,
+		MachineID:        machineID(hostname),
+		SystemUUID:       systemUUID,
+		BootID:           bootID(),
 	}, nil
 }
 

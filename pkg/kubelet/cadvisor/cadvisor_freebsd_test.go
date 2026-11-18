@@ -98,3 +98,47 @@ func TestTmpfsUsedLive(t *testing.T) {
 		t.Errorf("tmpfs usage %d MB -> %d MB after writing 64 MB", before/mb, after/mb)
 	}
 }
+
+func TestOSPrettyName(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct{ name, content, want string }{
+		{"quoted", "NAME=FreeBSD\nPRETTY_NAME=\"FreeBSD 15.1-RELEASE-p6\"\n", "FreeBSD 15.1-RELEASE-p6"},
+		{"unquoted", "PRETTY_NAME=FreeBSD\n", "FreeBSD"},
+		{"empty", "PRETTY_NAME=\"\"\n", "default"},
+		{"absent", "NAME=FreeBSD\n", "default"},
+	} {
+		p := filepath.Join(dir, tc.name)
+		if err := os.WriteFile(p, []byte(tc.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := osPrettyName(p, "default"); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	if got := osPrettyName(filepath.Join(dir, "missing"), "default"); got != "default" {
+		t.Errorf("missing file: got %q", got)
+	}
+}
+
+func TestNodeIdentityLive(t *testing.T) {
+	cc := &cadvisorClient{}
+	v, err := cc.VersionInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.KernelVersion == "" || v.ContainerOsVersion == "" {
+		t.Errorf("empty version info: %+v", v)
+	}
+	m, err := cc.MachineInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.BootID) != 36 || m.BootID != bootID() {
+		t.Errorf("boot ID %q is not a stable UUID", m.BootID)
+	}
+	if m.SystemUUID == "" || m.MachineID == "" {
+		t.Errorf("empty identity: %+v", m)
+	}
+	t.Logf("kernel %q, os %q, boot %s, system %s, machine %s", v.KernelVersion,
+		v.ContainerOsVersion, m.BootID, m.SystemUUID, m.MachineID)
+}
