@@ -107,3 +107,6 @@ func (m *realMountDetector) GetMountMedium(path string, requestedMedium v1.Stora
 	}
 	return v1.StorageMediumDefault, !notMnt, nil, nil
 }
+
+// platformTmpfsMountOptions are added to the tmpfs mount options.
+var platformTmpfsMountOptions []string

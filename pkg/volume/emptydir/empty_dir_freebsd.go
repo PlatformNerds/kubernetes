@@ -55,3 +55,9 @@ func (m *realMountDetector) GetMountMedium(path string, requestedMedium v1.Stora
 	}
 	return v1.StorageMediumDefault, !notMnt, nil, nil
 }
+
+// platformTmpfsMountOptions are added to the tmpfs mount options. FreeBSD's
+// tmpfs root takes the mode of the mount point, Linux's defaults to 1777:
+// ask for Linux's, which directories made from the volume's mode (subPath)
+// inherit.
+var platformTmpfsMountOptions = []string{"mode=1777"}

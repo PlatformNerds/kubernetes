@@ -581,5 +581,5 @@ func (ed *emptyDir) generateTmpfsMountOptions(noswapSupported bool) (options []s
 		options = append(options, swap.TmpfsNoswapOption)
 	}
 
-	return options
+	return append(options, platformTmpfsMountOptions...)
 }
