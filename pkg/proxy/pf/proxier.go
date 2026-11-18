@@ -491,12 +491,13 @@ type serviceRules struct {
 	clusterIP       net.IP
 	port, nodePort  int
 	nodeIPs         []net.IP
+	externalIPs     []net.IP // externalIPs and LoadBalancer ingress IPs
 	sticky          bool
 
 	// internal is where ClusterIP traffic goes (internalTrafficPolicy).
 	internal *pfTarget
-	// external is where NodePort traffic from outside the cluster goes
-	// (externalTrafficPolicy). With externalLocal and no local endpoint
+	// external is where traffic from outside the cluster to a NodePort,
+	// an external IP or a LoadBalancer IP goes (externalTrafficPolicy). With externalLocal and no local endpoint
 	// it is nil, and that traffic is dropped, as on Linux.
 	external      *pfTarget
 	externalLocal bool
@@ -530,30 +531,27 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 			}
 		}
 	}
-	// With externalTrafficPolicy: Local, the node's own NodePort
-	// connections short-circuit to all endpoints.
+	// With externalTrafficPolicy: Local, the node's own connections to
+	// external destinations short-circuit to all endpoints.
 	nodeTarget := r.external
 	if r.externalLocal && r.shortCircuit != nil {
 		nodeTarget = r.shortCircuit
 	}
-	if r.nodePort != 0 {
-		// So do pods' (the cluster CIDR). Without a local traffic
-		// detector they are treated as external, as on Linux.
+	dests := r.externalDestinations()
+	if len(dests) > 0 {
+		// So do this node's pods'. Without a local traffic detector
+		// they are treated as external, as on Linux.
 		podSource := ""
 		if r.externalLocal && r.shortCircuit != nil && proxier.localDetector != nil &&
 			proxier.localDetector.IsImplemented() {
 			podSource = proxier.localDetector.IfLocal()
 		}
-		for _, ip := range r.nodeIPs {
-			// Don't try to redirect ::1/128 or 127.0.0.0/8
-			if ip.IsLoopback() {
-				continue
-			}
+		for _, d := range dests {
 			if podSource != "" {
-				proxier.redirectRule(af, proto, podSource, ip, r.nodePort, r.shortCircuit.hosts, r.shortCircuit.port, r.sticky, nodePortTag)
+				proxier.redirectRule(af, proto, podSource, d.ip, d.port, r.shortCircuit.hosts, r.shortCircuit.port, r.sticky, nodePortTag)
 			}
 			if r.external != nil {
-				proxier.redirectRule(af, proto, "any", ip, r.nodePort, r.external.hosts, r.external.port, r.sticky, nodePortTag)
+				proxier.redirectRule(af, proto, "any", d.ip, d.port, r.external.hosts, r.external.port, r.sticky, nodePortTag)
 			}
 		}
 		// Masquerade only what goes to other nodes, to this node's
@@ -573,7 +571,7 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 				seen.Insert(k)
 			}
 			if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
-				klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", r.name)
+				klog.ErrorS(nil, "No node IP: external traffic to endpoints on other nodes is not masqueraded and may fail", "service", r.name)
 				break
 			}
 			proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(t.remote, ", ")+" }", t.port)
@@ -582,23 +580,47 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	if r.internal != nil {
 		proxier.hostRedirectRule(af, proto, r.clusterIP, r.port, r.internal.hosts, r.internal.port)
 	}
+	for _, d := range dests {
+		if nodeTarget != nil {
+			if d.isNodePort {
+				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget.hosts, nodeTarget.port)
+			} else {
+				proxier.hostRedirectRule(af, proto, d.ip, d.port, nodeTarget.hosts, nodeTarget.port)
+			}
+		}
+		if r.external == nil {
+			// externalTrafficPolicy: Local and no local
+			// endpoint: drop, so that a load balancer's
+			// health check sends clients elsewhere.
+			proxier.pfData.Write("block drop in quick", af, "proto", proto,
+				"from any to", d.ip.String(), "port", strconv.Itoa(d.port))
+		}
+	}
+}
+
+// externalDestination is an address and port that takes external traffic.
+type externalDestination struct {
+	ip         net.IP
+	port       int
+	isNodePort bool
+}
+
+// externalDestinations returns the node IPs with the NodePort, then the
+// externalIPs and LoadBalancer IPs with the service port.
+func (r *serviceRules) externalDestinations() []externalDestination {
+	var d []externalDestination
 	if r.nodePort != 0 {
 		for _, ip := range r.nodeIPs {
-			if ip.IsLoopback() {
-				continue
-			}
-			if nodeTarget != nil {
-				proxier.hostNodePortRule(af, proto, ip, r.nodePort, nodeTarget.hosts, nodeTarget.port)
-			}
-			if r.external == nil {
-				// externalTrafficPolicy: Local and no local
-				// endpoint: drop, so that a load balancer's
-				// health check sends clients elsewhere.
-				proxier.pfData.Write("block drop in quick", af, "proto", proto,
-					"from any to", ip.String(), "port", strconv.Itoa(r.nodePort))
+			// Don't try to redirect ::1/128 or 127.0.0.0/8
+			if !ip.IsLoopback() {
+				d = append(d, externalDestination{ip, r.nodePort, true})
 			}
 		}
 	}
+	for _, ip := range r.externalIPs {
+		d = append(d, externalDestination{ip, r.port, false})
+	}
+	return d
 }
 
 // hairpinSNATRule masquerades a pod's connection to a Service that was
@@ -806,7 +828,10 @@ func (proxier *Proxier) syncProxyRules() error {
 			sticky:    svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP,
 			internal:  newPFTarget(internalEndpoints),
 		}
-		if rules.nodePort != 0 {
+		// externalIPs and LoadBalancer ingress IPs (MetalLB and the
+		// like) take external traffic on the service port.
+		rules.externalIPs = append(append(rules.externalIPs, svcInfo.ExternalIPs()...), svcInfo.LoadBalancerVIPs()...)
+		if svcInfo.ExternallyAccessible() {
 			rules.external = newPFTarget(externalEndpoints)
 			rules.externalLocal = svcInfo.ExternalPolicyLocal()
 			if rules.externalLocal {
@@ -817,16 +842,14 @@ func (proxier *Proxier) syncProxyRules() error {
 			if rules.internal != nil {
 				udpFronts[pfAddrPort(svcInfo.ClusterIP().String(), svcInfo.Port())] = rules.internal.addrPorts()
 			}
-			if svcInfo.NodePort() != 0 {
-				endpoints := sets.New[string]()
-				for _, t := range []*pfTarget{rules.external, rules.shortCircuit} {
-					if t != nil {
-						endpoints = endpoints.Union(t.addrPorts())
-					}
+			endpoints := sets.New[string]()
+			for _, t := range []*pfTarget{rules.external, rules.shortCircuit} {
+				if t != nil {
+					endpoints = endpoints.Union(t.addrPorts())
 				}
-				for _, ip := range nodeIPs {
-					udpFronts[pfAddrPort(ip.String(), svcInfo.NodePort())] = endpoints
-				}
+			}
+			for _, d := range rules.externalDestinations() {
+				udpFronts[pfAddrPort(d.ip.String(), d.port)] = endpoints
 			}
 		}
 		if rules.internal == nil && rules.external == nil && rules.shortCircuit == nil {
@@ -877,6 +900,23 @@ func (proxier *Proxier) syncProxyRules() error {
 		if err := flushAnchor(proxier.exec, "cni-rdr/"+a); err != nil {
 			klog.Errorf("error flushing rules, err: %v", err)
 		}
+	}
+
+	// Without this, /healthz and /livez report kube-proxy unhealthy from
+	// the first Service change on.
+	if proxier.healthzServer != nil {
+		proxier.healthzServer.Updated(proxier.ipFamily)
+	}
+	metrics.SyncProxyRulesLastTimestamp.WithLabelValues(string(proxier.ipFamily)).SetToCurrentTime()
+
+	// Serve each externalTrafficPolicy: Local Service's healthCheckNodePort:
+	// 200 while this node has a ready endpoint, 503 otherwise, so that a
+	// load balancer only sends traffic to nodes that won't drop it.
+	if err := proxier.serviceHealthServer.SyncServices(proxier.svcPortMap.HealthCheckNodePorts()); err != nil {
+		proxier.logger.Error(err, "Error syncing healthcheck services")
+	}
+	if err := proxier.serviceHealthServer.SyncEndpoints(proxier.endpointsMap.LocalReadyEndpoints()); err != nil {
+		proxier.logger.Error(err, "Error syncing healthcheck endpoints")
 	}
 	return nil
 }

@@ -200,3 +200,28 @@ all udp 192.168.100.2:5354 -> 10.244.1.9:8082 (10.96.0.20:81)       SINGLE:NO_TR
 		t.Errorf("stale states:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
+
+// externalIPs and LoadBalancer IPs take external traffic on the service port
+// with the same policy as NodePorts; the node's own connections to them use
+// a plain outbound rdr-to (the address need not be on lo0).
+func TestWriteServiceRulesExternalIPs(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1"),
+		localDetector: NewDetectLocalByCIDR("10.244.0.0/24")}
+	all := target([]string{"10.244.0.5"}, []string{"10.244.1.7"}, 8080)
+	p.writeServiceRules(&serviceRules{name: "ns/svc:http", af: "inet", proto: "tcp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 80,
+		externalIPs: []net.IP{net.ParseIP("192.168.100.200")},
+		internal:    all, external: target([]string{"10.244.0.5"}, nil, 8080),
+		externalLocal: true, shortCircuit: all})
+	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
+		"rdr inet proto tcp from 10.244.0.0/24 to 192.168.100.200 port 80 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"rdr inet proto tcp from any to 192.168.100.200 port 80 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick inet proto tcp from any to 192.168.100.200 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+	checkOrder(t, p.pfData.String())
+}
