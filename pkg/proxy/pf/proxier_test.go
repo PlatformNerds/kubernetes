@@ -18,10 +18,12 @@ package pf
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/kubernetes/pkg/proxy"
 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 )
 
@@ -55,8 +57,8 @@ func TestRedirectRule(t *testing.T) {
 
 func TestHostRedirectRule(t *testing.T) {
 	p := &Proxier{pfData: proxyutil.NewLineBuffer()}
-	p.hostRedirectRule("inet", "udp", "any", net.ParseIP("10.96.0.10"), 53, "{ 10.244.0.206, 10.244.0.207 }", 53)
-	p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.1"), 443, "{ 192.168.100.1 }", 6443)
+	p.hostRedirectRule("inet", "udp", "any", net.ParseIP("10.96.0.10"), 53, target(nil, []string{"10.244.0.206", "10.244.0.207"}, 53))
+	p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.1"), 443, target(nil, []string{"192.168.100.1"}, 6443))
 	want := "pass out quick inet proto udp from any to 10.96.0.10 port 53 rdr-to { 10.244.0.206, 10.244.0.207 } port 53 round-robin\n" +
 		"pass out quick inet proto tcp from any to 10.96.0.1 port 443 rdr-to { 192.168.100.1 } port 6443 round-robin\n"
 	if got := p.pfData.String(); got != want {
@@ -93,8 +95,8 @@ func TestWriteServiceRulesOrder(t *testing.T) {
 		nodeIPs:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("192.168.100.1")},
 		internal: all, external: all})
 	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
-		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
 		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
 		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n"
@@ -117,9 +119,9 @@ func TestWriteServiceRulesExternalLocal(t *testing.T) {
 		internal: all, external: target([]string{"10.244.0.5"}, nil, 8080),
 		externalLocal: true, shortCircuit: all})
 	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
-		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"rdr inet proto tcp from 10.244.0.0/16 to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
 		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
 		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
 		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n"
@@ -214,9 +216,9 @@ func TestWriteServiceRulesExternalIPs(t *testing.T) {
 		internal:    all, external: target([]string{"10.244.0.5"}, nil, 8080),
 		externalLocal: true, shortCircuit: all})
 	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
-		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"rdr inet proto tcp from 10.244.0.0/24 to 192.168.100.200 port 80 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
 		"rdr inet proto tcp from any to 192.168.100.200 port 80 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
 		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
 		"pass out quick inet proto tcp from any to 192.168.100.200 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n"
@@ -240,10 +242,10 @@ func TestWriteServiceRulesLBSourceRanges(t *testing.T) {
 		internal:       all, external: all})
 	want := "table <lb_src> const { 203.0.113.0/24 }\n" +
 		"rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.0.5 } port 8080 round-robin\n" +
-		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"rdr inet proto tcp from any to 192.168.100.200 port 80 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
 		"no rdr inet proto tcp from ! <lb_src> to 192.168.100.201 port 80\n" +
 		"rdr inet proto tcp from any to 192.168.100.201 port 80 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.0.5 } port 8080 round-robin\n" +
 		"pass out quick inet proto tcp from any to 192.168.100.200 port 80 rdr-to { 10.244.0.5 } port 8080 round-robin\n" +
 		"pass out quick inet proto tcp from <lb_src> to 192.168.100.201 port 80 rdr-to { 10.244.0.5 } port 8080 round-robin\n" +
@@ -302,6 +304,71 @@ func TestWriteServiceRulesInternalLocalNoLocalEndpoint(t *testing.T) {
 		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
 		"block drop quick inet proto tcp from any to 10.96.0.20 port 80\n" +
 		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+	checkOrder(t, p.pfData.String())
+}
+
+// fakeEndpoint implements the parts of proxy.Endpoint newPFTarget uses.
+type fakeEndpoint struct {
+	proxy.Endpoint
+	ip    string
+	port  int
+	local bool
+}
+
+func (e fakeEndpoint) IP() string    { return e.ip }
+func (e fakeEndpoint) Port() int     { return e.port }
+func (e fakeEndpoint) IsLocal() bool { return e.local }
+
+// A named targetPort resolving to different ports: one group per port,
+// the largest first, ties to the lowest port.
+func TestNewPFTargetGroups(t *testing.T) {
+	tg := newPFTarget([]proxy.Endpoint{
+		fakeEndpoint{ip: "10.244.0.5", port: 8081, local: true},
+		fakeEndpoint{ip: "10.244.1.7", port: 8080},
+		fakeEndpoint{ip: "10.244.1.8", port: 8081},
+		fakeEndpoint{ip: "10.244.0.6", port: 8079, local: true},
+	})
+	var got []string
+	for _, g := range tg.groups() {
+		got = append(got, g.hosts+" port "+strconv.Itoa(g.port)+" local "+strings.Join(g.local, ","))
+	}
+	want := []string{
+		"{ 10.244.0.5, 10.244.1.8 } port 8081 local 10.244.0.5",
+		"{ 10.244.0.6 } port 8079 local 10.244.0.6",
+		"{ 10.244.1.7 } port 8080 local ",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if newPFTarget(nil) != nil {
+		t.Errorf("newPFTarget(nil) != nil")
+	}
+}
+
+// Endpoints on two ports: the redirects become filter rules that split
+// connections by group size; the hairpin and SNAT rules cover both ports.
+func TestWriteServiceRulesSplitPorts(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
+	a := &pfTarget{hosts: "{ 10.244.1.7, 10.244.0.5 }", port: 8080, local: []string{"10.244.0.5"}, remote: []string{"10.244.1.7"}}
+	a.more = []*pfTarget{{hosts: "{ 10.244.1.8 }", port: 8081, remote: []string{"10.244.1.8"}}}
+	p.writeServiceRules(&serviceRules{name: "ns/svc:http", af: "inet", proto: "tcp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 80, nodePort: 30080,
+		nodeIPs:  []net.IP{net.ParseIP("192.168.100.1")},
+		internal: a, external: a})
+	want := "nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
+		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+		"nat inet proto tcp from any to { 10.244.1.8 } port 8081 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+		"pass in quick inet proto tcp from any to 10.96.0.20 port 80 probability 66.67% rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"pass in quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.8 } port 8081 round-robin\n" +
+		"pass in quick inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT probability 66.67% rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"pass in quick inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT rdr-to { 10.244.1.8 } port 8081 round-robin\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 probability 66.67% rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.8 } port 8081 round-robin\n" +
+		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 probability 66.67% rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.8 } port 8081 round-robin\n"
 	if got := p.pfData.String(); got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}

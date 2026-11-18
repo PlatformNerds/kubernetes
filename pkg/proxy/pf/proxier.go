@@ -22,7 +22,9 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"fmt"
+	"math"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -444,43 +446,68 @@ type pfTarget struct {
 	port   int      // the endpoints' port
 	local  []string // endpoints on this node
 	remote []string // endpoints on other nodes
+	// more are the other port groups, when a named targetPort
+	// resolves to different ports on different endpoints.
+	more []*pfTarget
+}
+
+// groups returns the target's port groups, the largest first.
+func (t *pfTarget) groups() []*pfTarget {
+	return append([]*pfTarget{t}, t.more...)
+}
+
+func (t *pfTarget) size() int {
+	return len(t.local) + len(t.remote)
 }
 
 // newPFTarget returns the target for endpoints, or nil if there are none.
+// pf redirects to a single port per rule, so endpoints are grouped by port,
+// largest group first (ties: lowest port).
 func newPFTarget(endpoints []proxy.Endpoint) *pfTarget {
-	byPort := map[int][]proxy.Endpoint{}
+	byPort := map[int]*pfTarget{}
+	var groups []*pfTarget
 	for _, ep := range endpoints {
-		byPort[ep.Port()] = append(byPort[ep.Port()], ep)
-	}
-	var group []proxy.Endpoint
-	port := 0
-	for p, eps := range byPort {
-		if len(eps) > len(group) || len(eps) == len(group) && p < port {
-			group, port = eps, p
+		g := byPort[ep.Port()]
+		if g == nil {
+			g = &pfTarget{port: ep.Port()}
+			byPort[ep.Port()] = g
+			groups = append(groups, g)
+		}
+		if ep.IsLocal() {
+			g.local = append(g.local, ep.IP())
+		} else {
+			g.remote = append(g.remote, ep.IP())
+		}
+		if g.hosts == "" {
+			g.hosts = ep.IP()
+		} else {
+			g.hosts += ", " + ep.IP()
 		}
 	}
-	if len(group) == 0 {
+	if len(groups) == 0 {
 		return nil
 	}
-	t := &pfTarget{port: port}
-	ips := make([]string, 0, len(group))
-	for _, ep := range group {
-		ips = append(ips, ep.IP())
-		if ep.IsLocal() {
-			t.local = append(t.local, ep.IP())
-		} else {
-			t.remote = append(t.remote, ep.IP())
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].size() != groups[j].size() {
+			return groups[i].size() > groups[j].size()
 		}
+		return groups[i].port < groups[j].port
+	})
+	for _, g := range groups {
+		g.hosts = "{ " + g.hosts + " }"
 	}
-	t.hosts = "{ " + strings.Join(ips, ", ") + " }"
+	t := groups[0]
+	t.more = groups[1:]
 	return t
 }
 
 // addrPorts returns the target's endpoints as pf address:port strings.
 func (t *pfTarget) addrPorts() sets.Set[string] {
 	s := sets.New[string]()
-	for _, ip := range append(append([]string{}, t.local...), t.remote...) {
-		s.Insert(pfAddrPort(ip, t.port))
+	for _, g := range t.groups() {
+		for _, ip := range append(append([]string{}, g.local...), g.remote...) {
+			s.Insert(pfAddrPort(ip, g.port))
+		}
 	}
 	return s
 }
@@ -539,9 +566,56 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 			break
 		}
 	}
-	if r.internal != nil {
-		proxier.redirectRule(af, proto, "any", r.clusterIP, r.port, r.internal.hosts, r.internal.port, r.sticky, "")
+	// With externalTrafficPolicy: Local, the node's own connections to
+	// external destinations short-circuit to all endpoints.
+	nodeTarget := r.external
+	if r.externalLocal && r.shortCircuit != nil {
+		nodeTarget = r.shortCircuit
 	}
+	// So do this node's pods'. Without a local traffic detector they
+	// are treated as external, as on Linux.
+	podSource := ""
+	if r.externalLocal && r.shortCircuit != nil && proxier.localDetector != nil &&
+		proxier.localDetector.IsImplemented() {
+		podSource = proxier.localDetector.IfLocal()
+	}
+
+	// Inbound redirects, first match wins.
+	var redirects []inboundRedirect
+	if r.internal != nil {
+		redirects = append(redirects, inboundRedirect{source: "any", ip: r.clusterIP, port: r.port, target: r.internal})
+	}
+	for _, d := range dests {
+		if d.firewalled {
+			// loadBalancerSourceRanges: other sources stay
+			// untranslated and are dropped below.
+			redirects = append(redirects, inboundRedirect{source: "! " + lbSourceTable, ip: d.ip, port: d.port})
+		}
+		if podSource != "" {
+			redirects = append(redirects, inboundRedirect{source: podSource, ip: d.ip, port: d.port, target: r.shortCircuit, tag: nodePortTag})
+		}
+		if r.external != nil {
+			redirects = append(redirects, inboundRedirect{source: "any", ip: d.ip, port: d.port, target: r.external, tag: nodePortTag})
+		}
+	}
+	// A named targetPort resolving to different ports on different
+	// endpoints needs one redirect per port, chosen with probability,
+	// which only filter rules (rdr-to) have.
+	split := false
+	for _, t := range []*pfTarget{r.internal, r.external, r.shortCircuit} {
+		split = split || t != nil && len(t.more) > 0
+	}
+	if !split {
+		for _, rd := range redirects {
+			if rd.target == nil {
+				proxier.pfData.Write("no rdr", af, "proto", proto, "from", rd.source,
+					"to", rd.ip.String(), "port", strconv.Itoa(rd.port))
+			} else {
+				proxier.redirectRule(af, proto, rd.source, rd.ip, rd.port, rd.target.hosts, rd.target.port, r.sticky, rd.tag)
+			}
+		}
+	}
+
 	// hairpin: a local endpoint redirected to itself
 	if proxier.nodeIP != nil && !proxier.nodeIP.IsUnspecified() {
 		seen := sets.New[string]()
@@ -549,42 +623,17 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 			if t == nil {
 				continue
 			}
-			for _, ip := range t.local {
-				if k := pfAddrPort(ip, t.port); !seen.Has(k) {
-					seen.Insert(k)
-					proxier.hairpinSNATRule(af, proto, ip, t.port)
+			for _, g := range t.groups() {
+				for _, ip := range g.local {
+					if k := pfAddrPort(ip, g.port); !seen.Has(k) {
+						seen.Insert(k)
+						proxier.hairpinSNATRule(af, proto, ip, g.port)
+					}
 				}
 			}
 		}
 	}
-	// With externalTrafficPolicy: Local, the node's own connections to
-	// external destinations short-circuit to all endpoints.
-	nodeTarget := r.external
-	if r.externalLocal && r.shortCircuit != nil {
-		nodeTarget = r.shortCircuit
-	}
 	if len(dests) > 0 {
-		// So do this node's pods'. Without a local traffic detector
-		// they are treated as external, as on Linux.
-		podSource := ""
-		if r.externalLocal && r.shortCircuit != nil && proxier.localDetector != nil &&
-			proxier.localDetector.IsImplemented() {
-			podSource = proxier.localDetector.IfLocal()
-		}
-		for _, d := range dests {
-			if d.firewalled {
-				// loadBalancerSourceRanges: other sources stay
-				// untranslated and are dropped below.
-				proxier.pfData.Write("no rdr", af, "proto", proto, "from !", lbSourceTable,
-					"to", d.ip.String(), "port", strconv.Itoa(d.port))
-			}
-			if podSource != "" {
-				proxier.redirectRule(af, proto, podSource, d.ip, d.port, r.shortCircuit.hosts, r.shortCircuit.port, r.sticky, nodePortTag)
-			}
-			if r.external != nil {
-				proxier.redirectRule(af, proto, "any", d.ip, d.port, r.external.hosts, r.external.port, r.sticky, nodePortTag)
-			}
-		}
 		// Masquerade only what goes to other nodes, to this node's
 		// own address: a single cluster-wide masquerade address
 		// (LocalModeClusterCIDR) would route replies to a node
@@ -593,23 +642,44 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 		// keeps its source address.
 		seen := sets.New[string]()
 		for _, t := range []*pfTarget{nodeTarget, r.external} {
-			if t == nil || len(t.remote) == 0 {
+			if t == nil {
 				continue
 			}
-			if k := strings.Join(t.remote, ",") + "/" + strconv.Itoa(t.port); seen.Has(k) {
+			for _, g := range t.groups() {
+				if len(g.remote) == 0 {
+					continue
+				}
+				if k := strings.Join(g.remote, ",") + "/" + strconv.Itoa(g.port); seen.Has(k) {
+					continue
+				} else {
+					seen.Insert(k)
+				}
+				if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
+					klog.ErrorS(nil, "No node IP: external traffic to endpoints on other nodes is not masqueraded and may fail", "service", r.name)
+					break
+				}
+				proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(g.remote, ", ")+" }", g.port)
+			}
+		}
+	}
+
+	if split {
+		for _, rd := range redirects {
+			if rd.target == nil {
+				proxier.pfData.Write("block drop in quick", af, "proto", proto, "from", rd.source,
+					"to", rd.ip.String(), "port", strconv.Itoa(rd.port))
 				continue
-			} else {
-				seen.Insert(k)
 			}
-			if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
-				klog.ErrorS(nil, "No node IP: external traffic to endpoints on other nodes is not masqueraded and may fail", "service", r.name)
-				break
+			rule := []interface{}{"pass in quick", af, "proto", proto, "from", rd.source,
+				"to", rd.ip.String(), "port", strconv.Itoa(rd.port)}
+			if rd.tag != "" {
+				rule = append(rule, "tag", rd.tag)
 			}
-			proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(t.remote, ", ")+" }", t.port)
+			proxier.splitRedirect(rule, rd.target, r.sticky)
 		}
 	}
 	if r.internal != nil {
-		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal.hosts, r.internal.port)
+		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal)
 	} else {
 		// internalTrafficPolicy: Local and no local endpoint: drop,
 		// as on Linux, rather than send it to the default route.
@@ -619,13 +689,13 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	for _, d := range dests {
 		if nodeTarget != nil {
 			if d.isNodePort {
-				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget.hosts, nodeTarget.port)
+				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget)
 			} else {
 				source := "any"
 				if d.firewalled {
 					source = lbSourceTable
 				}
-				proxier.hostRedirectRule(af, proto, source, d.ip, d.port, nodeTarget.hosts, nodeTarget.port)
+				proxier.hostRedirectRule(af, proto, source, d.ip, d.port, nodeTarget)
 			}
 		}
 		// externalTrafficPolicy: Local and no local endpoint: drop,
@@ -641,6 +711,43 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 			proxier.pfData.Write("block drop out quick", af, "proto", proto,
 				"from any to", d.ip.String(), "port", strconv.Itoa(d.port))
 		}
+	}
+}
+
+// inboundRedirect redirects traffic from source to ip:port to target; with
+// no target, the traffic is left untranslated.
+type inboundRedirect struct {
+	source string
+	ip     net.IP
+	port   int
+	target *pfTarget
+	tag    string
+}
+
+// splitRedirect writes the filter rule once per port group of t, with
+// rdr-to that group. Each rule but the last takes its group's share of the
+// connections that reach it, so connections spread over all endpoints in
+// proportion, as over one pool.
+func (proxier *Proxier) splitRedirect(rule []interface{}, t *pfTarget, sticky bool) {
+	groups := t.groups()
+	left := 0
+	for _, g := range groups {
+		left += g.size()
+	}
+	for i, g := range groups {
+		words := append([]interface{}{}, rule...)
+		if i < len(groups)-1 {
+			words = append(words, "probability", strconv.FormatFloat(math.Round(10000*float64(g.size())/float64(left))/100, 'f', -1, 64)+"%")
+		}
+		words = append(words, "rdr-to", g.hosts, "port", strconv.Itoa(g.port))
+		if strings.HasPrefix(g.hosts, "{") {
+			words = append(words, "round-robin")
+			if sticky {
+				words = append(words, "sticky-address")
+			}
+		}
+		proxier.pfData.Write(words...)
+		left -= g.size()
 	}
 }
 
@@ -732,17 +839,12 @@ func (proxier *Proxier) hairpinSNATRule(af, proto string, endpointIP string, tar
 // address validation drops unless pf delivers them (the bsdk8s pf change
 // "deliver replies of redirected connections to the host's own address");
 // on other kernels this rule is harmless: such connections failed anyway.
-func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, targetIPs string, targetPort int) {
-	words := []interface{}{
+func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, t *pfTarget) {
+	proxier.splitRedirect([]interface{}{
 		"pass out quick on lo0", af, "proto", proto,
 		"from any to", nodeIP.String(),
 		"port", strconv.Itoa(nodePort),
-		"rdr-to", targetIPs, "port", strconv.Itoa(targetPort),
-	}
-	if strings.HasPrefix(targetIPs, "{") {
-		words = append(words, "round-robin")
-	}
-	proxier.pfData.Write(words...)
+	}, t, false)
 }
 
 // hostRedirectRule redirects traffic the node itself sends to a ClusterIP
@@ -759,17 +861,12 @@ func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePo
 // source tracking and would redirect every later connection of a client to
 // the client itself (fixed by the bsdk8s pf patch, not yet upstream), so
 // sessionAffinity is not honoured for host-network clients.
-func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int) {
-	words := []interface{}{
+func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, t *pfTarget) {
+	proxier.splitRedirect([]interface{}{
 		"pass out quick", af, "proto", proto,
 		"from", source, "to", destinationIP.String(),
 		"port", strconv.Itoa(destinationPort),
-		"rdr-to", targetIPs, "port", strconv.Itoa(targetPort),
-	}
-	if strings.HasPrefix(targetIPs, "{") {
-		words = append(words, "round-robin")
-	}
-	proxier.pfData.Write(words...)
+	}, t, false)
 }
 
 // flushAnchor removes all translation and filter rules of an anchor. Not
