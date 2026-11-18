@@ -416,10 +416,10 @@ const nodePortTag = "KUBE_NODEPORT"
 // the same endpoint for as long as pf tracks the source (while the client has
 // states; the global "set timeout src.track" extends that). A non-empty tag
 // is attached to the redirected packets.
-func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int, sticky bool, tag string) {
+func (proxier *Proxier) redirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, targetIPs string, targetPort int, sticky bool, tag string) {
 	words := []interface{}{
 		"rdr", af, "proto", proto,
-		"from any to", destinationIP.String(),
+		"from", source, "to", destinationIP.String(),
 		"port", strconv.Itoa(destinationPort),
 	}
 	if tag != "" {
@@ -435,48 +435,168 @@ func (proxier *Proxier) redirectRule(af, proto string, destinationIP net.IP, des
 	proxier.pfData.Write(words...)
 }
 
-// writeServiceRules writes one service port's anchor: rdr for its ClusterIP
-// and NodePorts, nat for NodePort traffic to remote endpoints, and filter
-// rules for traffic the node itself sends to the ClusterIP. pf rejects a
-// ruleset whose translation rules don't all come before its filter rules,
-// so the filter rules go last.
-func (proxier *Proxier) writeServiceRules(svcName, af, proto string, clusterIP net.IP, port, nodePort int, nodeIPs []net.IP,
-	redirHosts string, remoteIPs, localIPs []string, targetPort int, sticky bool) {
-	// redirect the service ip+port and optionally also the node port address+port
-	proxier.redirectRule(af, proto, clusterIP, port, redirHosts, targetPort, sticky, "")
-	// hairpin: a local endpoint redirected to itself
-	if proxier.nodeIP != nil && !proxier.nodeIP.IsUnspecified() {
-		for _, ip := range localIPs {
-			proxier.hairpinSNATRule(af, proto, ip, targetPort)
+// pfTarget is a set of endpoints that one rdr rule redirects to. pf
+// redirects to a single port, so when the endpoints listen on different
+// ports only the largest group with the same port is used; spreading over
+// several ports would need an external load balancer.
+type pfTarget struct {
+	hosts  string   // "{ ip, ... }"
+	port   int      // the endpoints' port
+	local  []string // endpoints on this node
+	remote []string // endpoints on other nodes
+}
+
+// newPFTarget returns the target for endpoints, or nil if there are none.
+func newPFTarget(endpoints []proxy.Endpoint) *pfTarget {
+	byPort := map[int][]proxy.Endpoint{}
+	for _, ep := range endpoints {
+		byPort[ep.Port()] = append(byPort[ep.Port()], ep)
+	}
+	var group []proxy.Endpoint
+	port := 0
+	for p, eps := range byPort {
+		if len(eps) > len(group) || len(eps) == len(group) && p < port {
+			group, port = eps, p
 		}
 	}
-	if nodePort != 0 {
-		for _, ip := range nodeIPs {
+	if len(group) == 0 {
+		return nil
+	}
+	t := &pfTarget{port: port}
+	ips := make([]string, 0, len(group))
+	for _, ep := range group {
+		ips = append(ips, ep.IP())
+		if ep.IsLocal() {
+			t.local = append(t.local, ep.IP())
+		} else {
+			t.remote = append(t.remote, ep.IP())
+		}
+	}
+	t.hosts = "{ " + strings.Join(ips, ", ") + " }"
+	return t
+}
+
+// addrPorts returns the target's endpoints as pf address:port strings.
+func (t *pfTarget) addrPorts() sets.Set[string] {
+	s := sets.New[string]()
+	for _, ip := range append(append([]string{}, t.local...), t.remote...) {
+		s.Insert(pfAddrPort(ip, t.port))
+	}
+	return s
+}
+
+// serviceRules describes one service port's anchor.
+type serviceRules struct {
+	name, af, proto string
+	clusterIP       net.IP
+	port, nodePort  int
+	nodeIPs         []net.IP
+	sticky          bool
+
+	// internal is where ClusterIP traffic goes (internalTrafficPolicy).
+	internal *pfTarget
+	// external is where NodePort traffic from outside the cluster goes
+	// (externalTrafficPolicy). With externalLocal and no local endpoint
+	// it is nil, and that traffic is dropped, as on Linux.
+	external      *pfTarget
+	externalLocal bool
+	// shortCircuit, with externalLocal only, is where NodePort traffic
+	// from pods and from the node itself goes: the cluster-wide endpoints.
+	shortCircuit *pfTarget
+}
+
+// writeServiceRules writes one service port's anchor: rdr for its ClusterIP
+// and NodePorts, nat for NodePort traffic to remote endpoints, and filter
+// rules for traffic the node itself sends to the ClusterIP or a NodePort.
+// pf rejects a ruleset whose translation rules don't all come before its
+// filter rules, so the filter rules go last.
+func (proxier *Proxier) writeServiceRules(r *serviceRules) {
+	af, proto := r.af, r.proto
+	if r.internal != nil {
+		proxier.redirectRule(af, proto, "any", r.clusterIP, r.port, r.internal.hosts, r.internal.port, r.sticky, "")
+	}
+	// hairpin: a local endpoint redirected to itself
+	if proxier.nodeIP != nil && !proxier.nodeIP.IsUnspecified() {
+		seen := sets.New[string]()
+		for _, t := range []*pfTarget{r.internal, r.shortCircuit, r.external} {
+			if t == nil {
+				continue
+			}
+			for _, ip := range t.local {
+				if k := pfAddrPort(ip, t.port); !seen.Has(k) {
+					seen.Insert(k)
+					proxier.hairpinSNATRule(af, proto, ip, t.port)
+				}
+			}
+		}
+	}
+	// With externalTrafficPolicy: Local, the node's own NodePort
+	// connections short-circuit to all endpoints.
+	nodeTarget := r.external
+	if r.externalLocal && r.shortCircuit != nil {
+		nodeTarget = r.shortCircuit
+	}
+	if r.nodePort != 0 {
+		// So do pods' (the cluster CIDR). Without a local traffic
+		// detector they are treated as external, as on Linux.
+		podSource := ""
+		if r.externalLocal && r.shortCircuit != nil && proxier.localDetector != nil &&
+			proxier.localDetector.IsImplemented() {
+			podSource = proxier.localDetector.IfLocal()
+		}
+		for _, ip := range r.nodeIPs {
 			// Don't try to redirect ::1/128 or 127.0.0.0/8
 			if ip.IsLoopback() {
 				continue
 			}
-			proxier.redirectRule(af, proto, ip, nodePort, redirHosts, targetPort, sticky, nodePortTag)
+			if podSource != "" {
+				proxier.redirectRule(af, proto, podSource, ip, r.nodePort, r.shortCircuit.hosts, r.shortCircuit.port, r.sticky, nodePortTag)
+			}
+			if r.external != nil {
+				proxier.redirectRule(af, proto, "any", ip, r.nodePort, r.external.hosts, r.external.port, r.sticky, nodePortTag)
+			}
 		}
 		// Masquerade only what goes to other nodes, to this node's
 		// own address: a single cluster-wide masquerade address
 		// (LocalModeClusterCIDR) would route replies to a node
-		// that can't reverse the NAT.
-		if len(remoteIPs) > 0 {
-			if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
-				klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", svcName)
-			} else {
-				proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(remoteIPs, ", ")+" }", targetPort)
+		// that can't reverse the NAT. With externalTrafficPolicy:
+		// Local, external traffic only reaches local endpoints and
+		// keeps its source address.
+		seen := sets.New[string]()
+		for _, t := range []*pfTarget{nodeTarget, r.external} {
+			if t == nil || len(t.remote) == 0 {
+				continue
 			}
+			if k := strings.Join(t.remote, ",") + "/" + strconv.Itoa(t.port); seen.Has(k) {
+				continue
+			} else {
+				seen.Insert(k)
+			}
+			if proxier.nodeIP == nil || proxier.nodeIP.IsUnspecified() {
+				klog.ErrorS(nil, "No node IP: NodePort traffic to endpoints on other nodes is not masqueraded and may fail", "service", r.name)
+				break
+			}
+			proxier.nodePortSNATRule(af, proto, "{ "+strings.Join(t.remote, ", ")+" }", t.port)
 		}
 	}
-	proxier.hostRedirectRule(af, proto, clusterIP, port, redirHosts, targetPort)
-	if nodePort != 0 {
-		for _, ip := range nodeIPs {
+	if r.internal != nil {
+		proxier.hostRedirectRule(af, proto, r.clusterIP, r.port, r.internal.hosts, r.internal.port)
+	}
+	if r.nodePort != 0 {
+		for _, ip := range r.nodeIPs {
 			if ip.IsLoopback() {
 				continue
 			}
-			proxier.hostNodePortRule(af, proto, ip, nodePort, redirHosts, targetPort)
+			if nodeTarget != nil {
+				proxier.hostNodePortRule(af, proto, ip, r.nodePort, nodeTarget.hosts, nodeTarget.port)
+			}
+			if r.external == nil {
+				// externalTrafficPolicy: Local and no local
+				// endpoint: drop, so that a load balancer's
+				// health check sends clients elsewhere.
+				proxier.pfData.Write("block drop in quick", af, "proto", proto,
+					"from any to", ip.String(), "port", strconv.Itoa(r.nodePort))
+			}
 		}
 	}
 }
@@ -656,36 +776,60 @@ func (proxier *Proxier) syncProxyRules() error {
 			klog.Infof("allLocallyReachableEndpoints: %v", allLocallyReachableEndpoints)
 		}
 
-		// Note: we can only redirect traffic to a single port with
-		// PF. We choose the largest group here - external load
-		// balancing would be needed to spread traffic across multiple
-		// ports.
-		endpointsByPort := map[int][]proxy.Endpoint{}
-		for _, ep := range allLocallyReachableEndpoints {
-			port := ep.Port()
-			endpointsByPort[port] = append(endpointsByPort[port], ep)
+		// Which endpoints each kind of traffic may reach, as in the
+		// iptables proxier: ClusterIP traffic follows
+		// internalTrafficPolicy, NodePort traffic from outside the
+		// cluster follows externalTrafficPolicy, and with
+		// externalTrafficPolicy: Local, NodePort traffic from pods and
+		// from the node itself short-circuits to the cluster-wide
+		// endpoints (Local only exists to keep external clients'
+		// addresses, which pods and the node don't need).
+		internalEndpoints := clusterEndpoints
+		if svcInfo.InternalPolicyLocal() {
+			internalEndpoints = localEndpoints
 		}
-		targetEndpoints := []proxy.Endpoint{}
-		targetPort := 0
-		for port, eps := range endpointsByPort {
-			if len(eps) > len(targetEndpoints) {
-				targetEndpoints = eps
-				targetPort = port
+		externalEndpoints := clusterEndpoints
+		var shortCircuitEndpoints []proxy.Endpoint
+		if svcInfo.ExternalPolicyLocal() {
+			externalEndpoints = localEndpoints
+			shortCircuitEndpoints = clusterEndpoints
+			if len(shortCircuitEndpoints) == 0 {
+				shortCircuitEndpoints = internalEndpoints
+			}
+		}
+		rules := serviceRules{
+			name:      svcName.String(),
+			clusterIP: svcInfo.ClusterIP(),
+			port:      svcInfo.Port(),
+			nodePort:  svcInfo.NodePort(),
+			nodeIPs:   nodeIPs,
+			sticky:    svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP,
+			internal:  newPFTarget(internalEndpoints),
+		}
+		if rules.nodePort != 0 {
+			rules.external = newPFTarget(externalEndpoints)
+			rules.externalLocal = svcInfo.ExternalPolicyLocal()
+			if rules.externalLocal {
+				rules.shortCircuit = newPFTarget(shortCircuitEndpoints)
 			}
 		}
 		if svcInfo.Protocol() == v1.ProtocolUDP {
-			endpoints := sets.New[string]()
-			for _, ep := range targetEndpoints {
-				endpoints.Insert(pfAddrPort(ep.IP(), targetPort))
+			if rules.internal != nil {
+				udpFronts[pfAddrPort(svcInfo.ClusterIP().String(), svcInfo.Port())] = rules.internal.addrPorts()
 			}
-			udpFronts[pfAddrPort(svcInfo.ClusterIP().String(), svcInfo.Port())] = endpoints
 			if svcInfo.NodePort() != 0 {
+				endpoints := sets.New[string]()
+				for _, t := range []*pfTarget{rules.external, rules.shortCircuit} {
+					if t != nil {
+						endpoints = endpoints.Union(t.addrPorts())
+					}
+				}
 				for _, ip := range nodeIPs {
 					udpFronts[pfAddrPort(ip.String(), svcInfo.NodePort())] = endpoints
 				}
 			}
 		}
-		if len(targetEndpoints) == 0 {
+		if rules.internal == nil && rules.external == nil && rules.shortCircuit == nil {
 			// No endpoints (left): drop the rules that still redirect
 			// to the old ones.
 			if err := flushAnchor(proxier.exec, "cni-rdr/"+svcInfo.anchorName); err != nil {
@@ -694,39 +838,22 @@ func (proxier *Proxier) syncProxyRules() error {
 			continue
 		}
 
-		// Format this list for the redirect rule(s)
-		ips := []string{}
-		for _, ep := range targetEndpoints {
-			ips = append(ips, ep.IP())
-		}
-		redirHosts := "{ " + strings.Join(ips, ", ") + " }"
-
-		af := "inet"
+		rules.af = "inet"
 		if proxier.ipFamily == v1.IPv6Protocol {
-			af = "inet6"
+			rules.af = "inet6"
 		}
 
-		var proto string
 		switch svcInfo.Protocol() {
 		case v1.ProtocolTCP:
-			proto = "tcp"
+			rules.proto = "tcp"
 		case v1.ProtocolUDP:
-			proto = "udp"
+			rules.proto = "udp"
 		case v1.ProtocolSCTP:
-			proto = "sctp"
+			rules.proto = "sctp"
 		}
 
-		remoteIPs, localIPs := []string{}, []string{}
-		for _, ep := range targetEndpoints {
-			if ep.IsLocal() {
-				localIPs = append(localIPs, ep.IP())
-			} else {
-				remoteIPs = append(remoteIPs, ep.IP())
-			}
-		}
 		proxier.pfData.Reset()
-		proxier.writeServiceRules(svcName.String(), af, proto, svcInfo.ClusterIP(), svcInfo.Port(), svcInfo.NodePort(), nodeIPs,
-			redirHosts, remoteIPs, localIPs, targetPort, svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP)
+		proxier.writeServiceRules(&rules)
 
 		if proxier.logger.V(2).Enabled() {
 			klog.Infof("pfctl -a cni-rdr/%s -f - <EOF", svcInfo.anchorName)

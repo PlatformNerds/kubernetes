@@ -45,7 +45,7 @@ func TestRedirectRule(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := &Proxier{pfData: proxyutil.NewLineBuffer()}
-			p.redirectRule("inet", "tcp", ip, 30080, tc.targets, 8080, tc.sticky, tc.tag)
+			p.redirectRule("inet", "tcp", "any", ip, 30080, tc.targets, 8080, tc.sticky, tc.tag)
 			if got := p.pfData.String(); got != tc.want {
 				t.Errorf("got  %q\nwant %q", got, tc.want)
 			}
@@ -64,14 +64,34 @@ func TestHostRedirectRule(t *testing.T) {
 	}
 }
 
-// pf refuses an anchor whose translation rules (rdr, nat) don't all come
-// before its filter rules (pass): a NodePort service, with rdr and nat rules
-// for the node ports, must still put the host ClusterIP rule last.
+// checkOrder fails if a translation rule follows a filter rule: pf refuses
+// such an anchor.
+func checkOrder(t *testing.T, rules string) {
+	t.Helper()
+	seenFilter := false
+	for _, l := range strings.Split(strings.TrimSpace(rules), "\n") {
+		isFilter := strings.HasPrefix(l, "pass") || strings.HasPrefix(l, "block") || strings.HasPrefix(l, "match")
+		if seenFilter && !isFilter {
+			t.Errorf("translation rule after a filter rule: %q", l)
+		}
+		seenFilter = seenFilter || isFilter
+	}
+}
+
+func target(local, remote []string, port int) *pfTarget {
+	ips := append(append([]string{}, remote...), local...)
+	return &pfTarget{hosts: "{ " + strings.Join(ips, ", ") + " }", port: port, local: local, remote: remote}
+}
+
+// A NodePort service with externalTrafficPolicy: Cluster: every kind of
+// traffic goes to all endpoints, and the host rules come last.
 func TestWriteServiceRulesOrder(t *testing.T) {
 	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
-	p.writeServiceRules("ns/svc:http", "inet", "tcp", net.ParseIP("10.96.0.20"), 80, 30080,
-		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("192.168.100.1")},
-		"{ 10.244.1.7, 10.244.0.5 }", []string{"10.244.1.7"}, []string{"10.244.0.5"}, 8080, false)
+	all := target([]string{"10.244.0.5"}, []string{"10.244.1.7"}, 8080)
+	p.writeServiceRules(&serviceRules{name: "ns/svc:http", af: "inet", proto: "tcp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 80, nodePort: 30080,
+		nodeIPs:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("192.168.100.1")},
+		internal: all, external: all})
 	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
 		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
 		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
@@ -81,14 +101,54 @@ func TestWriteServiceRulesOrder(t *testing.T) {
 	if got := p.pfData.String(); got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}
-	seenFilter := false
-	for _, l := range strings.Split(strings.TrimSpace(p.pfData.String()), "\n") {
-		isFilter := strings.HasPrefix(l, "pass") || strings.HasPrefix(l, "block") || strings.HasPrefix(l, "match")
-		if seenFilter && !isFilter {
-			t.Errorf("translation rule after a filter rule: %q", l)
-		}
-		seenFilter = seenFilter || isFilter
+	checkOrder(t, p.pfData.String())
+}
+
+// externalTrafficPolicy: Local with a local endpoint: external clients reach
+// only the local endpoint, unmasqueraded (their address is kept); pods and
+// the node itself reach all endpoints.
+func TestWriteServiceRulesExternalLocal(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1"),
+		localDetector: NewDetectLocalByCIDR("10.244.0.0/16")}
+	all := target([]string{"10.244.0.5"}, []string{"10.244.1.7"}, 8080)
+	p.writeServiceRules(&serviceRules{name: "ns/svc:http", af: "inet", proto: "tcp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 80, nodePort: 30080,
+		nodeIPs:  []net.IP{net.ParseIP("192.168.100.1")},
+		internal: all, external: target([]string{"10.244.0.5"}, nil, 8080),
+		externalLocal: true, shortCircuit: all})
+	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from 10.244.0.5 to 10.244.0.5 port 8080 -> 192.168.100.1\n" +
+		"rdr inet proto tcp from 10.244.0.0/16 to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.0.5 } port 8080 round-robin\n" +
+		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n" +
+		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7, 10.244.0.5 } port 8080 round-robin\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}
+	checkOrder(t, p.pfData.String())
+}
+
+// externalTrafficPolicy: Local without a local endpoint: external NodePort
+// traffic is dropped; pods and the node itself still reach the service.
+func TestWriteServiceRulesExternalLocalNoLocalEndpoint(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1"),
+		localDetector: NewDetectLocalByCIDR("10.244.0.0/16")}
+	remote := target(nil, []string{"10.244.1.7"}, 8080)
+	p.writeServiceRules(&serviceRules{name: "ns/svc:http", af: "inet", proto: "tcp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 80, nodePort: 30080,
+		nodeIPs:  []net.IP{net.ParseIP("192.168.100.1")},
+		internal: remote, externalLocal: true, shortCircuit: remote})
+	want := "rdr inet proto tcp from any to 10.96.0.20 port 80 -> { 10.244.1.7 } port 8080 round-robin\n" +
+		"rdr inet proto tcp from 10.244.0.0/16 to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7 } port 8080 round-robin\n" +
+		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+		"pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.1.7 } port 8080 round-robin\n" +
+		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7 } port 8080 round-robin\n" +
+		"block drop in quick inet proto tcp from any to 192.168.100.1 port 30080\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+	checkOrder(t, p.pfData.String())
 }
 
 func TestNodePortSNATRule(t *testing.T) {
