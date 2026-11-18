@@ -510,6 +510,12 @@ type serviceRules struct {
 	shortCircuit *pfTarget
 }
 
+// noEndpoints reports whether no traffic to the service can reach an
+// endpoint (iptables: no locally reachable endpoints).
+func (r *serviceRules) noEndpoints() bool {
+	return r.internal == nil && r.external == nil && r.shortCircuit == nil
+}
+
 // writeServiceRules writes one service port's anchor: rdr for its ClusterIP
 // and NodePorts, nat for NodePort traffic to remote endpoints, and filter
 // rules for traffic the node itself sends to the ClusterIP or a NodePort.
@@ -518,6 +524,15 @@ type serviceRules struct {
 func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	af, proto := r.af, r.proto
 	dests := r.externalDestinations()
+	if r.noEndpoints() {
+		// Reject (TCP RST, ICMP unreachable) rather than let clients
+		// time out, as on Linux.
+		proxier.rejectRule(af, proto, r.clusterIP, r.port)
+		for _, d := range dests {
+			proxier.rejectRule(af, proto, d.ip, d.port)
+		}
+		return
+	}
 	for _, d := range dests {
 		if d.firewalled {
 			proxier.pfData.Write("table", lbSourceTable, "const", "{", strings.Join(r.lbSourceRanges, ", "), "}")
@@ -595,6 +610,11 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	}
 	if r.internal != nil {
 		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal.hosts, r.internal.port)
+	} else {
+		// internalTrafficPolicy: Local and no local endpoint: drop,
+		// as on Linux, rather than send it to the default route.
+		proxier.pfData.Write("block drop quick", af, "proto", proto,
+			"from any to", r.clusterIP.String(), "port", strconv.Itoa(r.port))
 	}
 	for _, d := range dests {
 		if nodeTarget != nil {
@@ -622,6 +642,13 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 				"from any to", d.ip.String(), "port", strconv.Itoa(d.port))
 		}
 	}
+}
+
+// rejectRule rejects connections to a service address and port, in both
+// directions: from pods and other hosts (in) and from the node itself (out).
+func (proxier *Proxier) rejectRule(af, proto string, ip net.IP, port int) {
+	proxier.pfData.Write("block return quick", af, "proto", proto,
+		"from any to", ip.String(), "port", strconv.Itoa(port))
 }
 
 // lbSourceTable is the anchor table of sources allowed to reach a Service's
@@ -913,15 +940,6 @@ func (proxier *Proxier) syncProxyRules() error {
 				udpFronts[pfAddrPort(d.ip.String(), d.port)] = endpoints
 			}
 		}
-		if rules.internal == nil && rules.external == nil && rules.shortCircuit == nil {
-			// No endpoints (left): drop the rules that still redirect
-			// to the old ones.
-			if err := flushAnchor(proxier.exec, "cni-rdr/"+svcInfo.anchorName); err != nil {
-				klog.ErrorS(err, "Failed to flush rules of service without endpoints", "service", svcName)
-			}
-			continue
-		}
-
 		rules.af = "inet"
 		if proxier.ipFamily == v1.IPv6Protocol {
 			rules.af = "inet6"

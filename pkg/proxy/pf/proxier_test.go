@@ -274,3 +274,36 @@ func TestLBSourceRanges(t *testing.T) {
 		}
 	}
 }
+
+// No endpoints: connections to every address of the service are rejected.
+func TestWriteServiceRulesNoEndpoints(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
+	p.writeServiceRules(&serviceRules{name: "ns/svc:dns", af: "inet", proto: "udp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 53, nodePort: 30053,
+		nodeIPs:     []net.IP{net.ParseIP("192.168.100.1")},
+		externalIPs: []net.IP{net.ParseIP("192.168.100.200")}})
+	want := "block return quick inet proto udp from any to 10.96.0.20 port 53\n" +
+		"block return quick inet proto udp from any to 192.168.100.1 port 30053\n" +
+		"block return quick inet proto udp from any to 192.168.100.200 port 53\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+}
+
+// internalTrafficPolicy: Local without a local endpoint, but NodePort
+// traffic still has endpoints: ClusterIP traffic is dropped.
+func TestWriteServiceRulesInternalLocalNoLocalEndpoint(t *testing.T) {
+	p := &Proxier{pfData: proxyutil.NewLineBuffer(), nodeIP: net.ParseIP("192.168.100.1")}
+	remote := target(nil, []string{"10.244.1.7"}, 8080)
+	p.writeServiceRules(&serviceRules{name: "ns/svc:http", af: "inet", proto: "tcp",
+		clusterIP: net.ParseIP("10.96.0.20"), port: 80, nodePort: 30080,
+		nodeIPs: []net.IP{net.ParseIP("192.168.100.1")}, external: remote})
+	want := "rdr inet proto tcp from any to 192.168.100.1 port 30080 tag KUBE_NODEPORT -> { 10.244.1.7 } port 8080 round-robin\n" +
+		"nat inet proto tcp from any to { 10.244.1.7 } port 8080 tagged KUBE_NODEPORT -> 192.168.100.1\n" +
+		"block drop quick inet proto tcp from any to 10.96.0.20 port 80\n" +
+		"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.1.7 } port 8080 round-robin\n"
+	if got := p.pfData.String(); got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+	checkOrder(t, p.pfData.String())
+}
