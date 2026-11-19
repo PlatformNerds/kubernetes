@@ -144,6 +144,12 @@ type Proxier struct {
 	// Inject for test purpose.
 	networkInterfacer proxyutil.NetworkInterfacer
 
+	// sctpRdrPorts reports whether pf may change SCTP ports on rdr
+	// (sysctl net.pf.sctp_rdr_ports); sctpWarned holds the Service
+	// ports already warned about.
+	sctpRdrPorts func() (bool, error)
+	sctpWarned   sets.Set[string]
+
 	logger klog.Logger
 }
 
@@ -188,6 +194,8 @@ func NewProxier(ctx context.Context,
 		pfData:              proxyutil.NewLineBuffer(),
 		nodePortAddresses:   nodePortAddresses,
 		networkInterfacer:   proxyutil.RealNetwork{},
+		sctpRdrPorts:        pfSCTPRdrPorts,
+		sctpWarned:          sets.New[string](),
 		logger:              logger,
 	}
 
@@ -537,6 +545,41 @@ type serviceRules struct {
 	shortCircuit *pfTarget
 }
 
+// checkSCTPPorts warns, once per Service port, when reaching an SCTP Service
+// means changing the destination port (a targetPort or NodePort different
+// from the port it is reached on) but pf will not: by default pf leaves SCTP
+// ports alone, and connections then reach the endpoints on the wrong port.
+// sysctl net.pf.sctp_rdr_ports=1 (a BSDKubernetes kernel patch) allows it.
+func (proxier *Proxier) checkSCTPPorts(r *serviceRules, dests []externalDestination) {
+	key := r.name
+	if proxier.sctpWarned.Has(key) {
+		return
+	}
+	differs := false
+	for _, t := range []*pfTarget{r.internal, r.external, r.shortCircuit} {
+		if t == nil {
+			continue
+		}
+		for _, g := range t.groups() {
+			differs = differs || g.port != r.port
+			for _, d := range dests {
+				differs = differs || g.port != d.port
+			}
+		}
+	}
+	if !differs {
+		return
+	}
+	on, err := proxier.sctpRdrPorts()
+	if on {
+		return
+	}
+	proxier.sctpWarned.Insert(key)
+	proxier.logger.Info("pf will not change the destination port of this SCTP Service's connections, "+
+		"so they reach its endpoints on the wrong port: set sysctl net.pf.sctp_rdr_ports=1",
+		"service", r.name, "port", r.port, "nodePort", r.nodePort, "err", err)
+}
+
 // noEndpoints reports whether no traffic to the service can reach an
 // endpoint (iptables: no locally reachable endpoints).
 func (r *serviceRules) noEndpoints() bool {
@@ -551,6 +594,9 @@ func (r *serviceRules) noEndpoints() bool {
 func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	af, proto := r.af, r.proto
 	dests := r.externalDestinations()
+	if proto == "sctp" {
+		proxier.checkSCTPPorts(r, dests)
+	}
 	if r.noEndpoints() {
 		// Reject (TCP RST, ICMP unreachable) rather than let clients
 		// time out, as on Linux.

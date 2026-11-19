@@ -374,3 +374,47 @@ func TestWriteServiceRulesSplitPorts(t *testing.T) {
 	}
 	checkOrder(t, p.pfData.String())
 }
+
+func TestCheckSCTPPorts(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		port       int
+		nodePort   int
+		targetPort int
+		rdrPorts   bool
+		warned     bool
+	}{
+		{name: "same port", port: 9000, targetPort: 9000},
+		{name: "targetPort differs", port: 95, targetPort: 8081, warned: true},
+		{name: "nodePort differs", port: 9000, nodePort: 30000, targetPort: 9000, warned: true},
+		{name: "targetPort differs, pf allowed", port: 95, targetPort: 8081, rdrPorts: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			p := &Proxier{
+				pfData:     proxyutil.NewLineBuffer(),
+				sctpWarned: sets.New[string](),
+				sctpRdrPorts: func() (bool, error) {
+					calls++
+					return tc.rdrPorts, nil
+				},
+			}
+			r := &serviceRules{
+				name: "ns/svc:s", af: "inet", proto: "sctp",
+				clusterIP: net.ParseIP("10.96.0.10"),
+				port:      tc.port, nodePort: tc.nodePort,
+				nodeIPs:  []net.IP{net.ParseIP("192.168.100.1")},
+				internal: target([]string{"10.244.0.5"}, nil, tc.targetPort),
+				external: target([]string{"10.244.0.5"}, nil, tc.targetPort),
+			}
+			p.writeServiceRules(r)
+			p.writeServiceRules(r)
+			if got := p.sctpWarned.Has("ns/svc:s"); got != tc.warned {
+				t.Errorf("warned = %v, want %v", got, tc.warned)
+			}
+			if tc.warned && calls != 1 {
+				t.Errorf("sysctl read %d times, want once (warn once)", calls)
+			}
+		})
+	}
+}
