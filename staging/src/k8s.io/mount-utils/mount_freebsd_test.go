@@ -50,3 +50,21 @@ func TestNullfsMountRefs(t *testing.T) {
 		}
 	}
 }
+
+func TestWithNFSRetryCount(t *testing.T) {
+	for _, tc := range []struct {
+		fstype  string
+		options []string
+		want    []string
+	}{
+		{"nfs", nil, []string{"retrycnt=3"}},
+		{"nfs", []string{"vers=4.1"}, []string{"vers=4.1", "retrycnt=3"}},
+		{"nfs", []string{"retrycnt=0"}, []string{"retrycnt=0"}},
+		{"nullfs", []string{"ro"}, []string{"ro"}},
+		{"tmpfs", nil, nil},
+	} {
+		if got := withNFSRetryCount(tc.fstype, tc.options); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("withNFSRetryCount(%q, %v) = %v, want %v", tc.fstype, tc.options, got, tc.want)
+		}
+	}
+}

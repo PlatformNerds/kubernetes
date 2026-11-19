@@ -198,6 +198,7 @@ func (mounter *SafeFormatAndMount) diskLooksUnformatted(disk string) (bool, erro
 // systemdMountRequired is an extension of option to decide whether uses systemd
 // mount.
 func (mounter *Mounter) doMount(mountCmd string, source string, target string, fstype string, options []string, sensitiveOptions []string, mountFlags []string) error {
+	options = withNFSRetryCount(fstype, options)
 	mountArgs, mountArgsLogStr := MakeMountArgsSensitiveWithMountFlags(source, target, fstype, options, sensitiveOptions, mountFlags)
 
 	// Logging with sensitive mount options removed.
@@ -210,6 +211,27 @@ func (mounter *Mounter) doMount(mountCmd string, source string, target string, f
 			err, mountCmd, mountArgsLogStr, string(output))
 	}
 	return err
+}
+
+// nfsRetryCount bounds how often mount_nfs(8) tries an NFS server that doesn't
+// answer. mount_nfs retries forever by default, a minute apart, so the mount
+// would never return: the volume's operation stays pending, and its pod can
+// neither start nor be torn down. Linux's mount.nfs gives up after two minutes
+// in the foreground; three attempts a minute apart take as long.
+const nfsRetryCount = "retrycnt=3"
+
+// withNFSRetryCount adds nfsRetryCount to the options of an NFS mount that
+// doesn't set a retry count itself.
+func withNFSRetryCount(fstype string, options []string) []string {
+	if fstype != "nfs" {
+		return options
+	}
+	for _, o := range options {
+		if strings.HasPrefix(o, "retrycnt=") {
+			return options
+		}
+	}
+	return append(append([]string(nil), options...), nfsRetryCount)
 }
 
 // MakeMountArgsSensitive makes the arguments to the mount(8) command.
