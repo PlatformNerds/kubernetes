@@ -64,6 +64,11 @@ func main() {
 	}
 }
 
+// packetReader reads TCP segments the way a raw ip:tcp socket does.
+type packetReader interface {
+	ReadFrom(b []byte) (int, net.Addr, error)
+}
+
 func probe(ip string) {
 	log.Printf("probing %v", ip)
 
@@ -76,12 +81,16 @@ func probe(ip string) {
 	if err != nil {
 		panic(err)
 	}
+	rd, err := newSniffer(conn, ipAddr.IP)
+	if err != nil {
+		panic(err)
+	}
 
 	pending := make(map[string]uint32)
 
 	var buffer [4096]byte
 	for {
-		n, addr, err := conn.ReadFrom(buffer[:])
+		n, addr, err := rd.ReadFrom(buffer[:])
 		if err != nil {
 			log.Printf("conn.ReadFrom() error: %v", err)
 			continue
