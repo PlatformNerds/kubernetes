@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/moby/sys/mountinfo"
@@ -133,10 +134,52 @@ func (mounter *Mounter) IsMountPoint(file string) (bool, error) {
 	return false, nil
 }
 
-// GetMountRefs always returns an error on unsupported platforms
+// GetMountRefs finds the other mount points of the directory pathname is, or
+// is mounted from. FreeBSD's bind mounts are nullfs mounts, whose source
+// (f_mntfromname) is the directory they show, so the references are the nullfs
+// mounts that share pathname's source. Like Linux, pathname itself is left out.
+// The local volume plugin uses this to see whether another pod already uses a
+// volume before it applies fsGroup.
 func (mounter *Mounter) GetMountRefs(pathname string) ([]string, error) {
-	//return nil, errUnsupported
-	return nil, errors.New("mount.GetMountRefs unsupported")
+	pathExists, pathErr := PathExists(pathname)
+	if !pathExists {
+		return []string{}, nil
+	} else if IsCorruptedMnt(pathErr) {
+		klog.Warningf("GetMountRefs found corrupted mount at %s, treating as unmounted path", pathname)
+		return []string{}, nil
+	} else if pathErr != nil {
+		return nil, fmt.Errorf("error checking path %s: %v", pathname, pathErr)
+	}
+	realpath, err := filepath.EvalSymlinks(pathname)
+	if err != nil {
+		return nil, err
+	}
+	mps, err := mounter.List()
+	if err != nil {
+		return nil, err
+	}
+	return nullfsMountRefs(realpath, mps), nil
+}
+
+// nullfsMountRefs returns the nullfs mount points showing the same directory
+// as path, other than path: path's own source if path is a nullfs mount point,
+// otherwise path itself.
+func nullfsMountRefs(path string, mps []MountPoint) []string {
+	path = filepath.Clean(path)
+	source := path
+	for _, mp := range mps {
+		if mp.Type == "nullfs" && filepath.Clean(mp.Path) == path {
+			source = filepath.Clean(mp.Device)
+		}
+	}
+	refs := []string{}
+	for _, mp := range mps {
+		p := filepath.Clean(mp.Path)
+		if mp.Type == "nullfs" && filepath.Clean(mp.Device) == source && p != path {
+			refs = append(refs, p)
+		}
+	}
+	return refs
 }
 
 func (mounter *SafeFormatAndMount) formatAndMountSensitive(source string, target string, fstype string, options []string, sensitiveOptions []string, formatOptions []string) error {
