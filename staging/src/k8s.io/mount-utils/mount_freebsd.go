@@ -76,7 +76,7 @@ func (mounter *Mounter) MountSensitive(source string, target string, fstype stri
 	return mounter.doMount(mountCmd, source, target, fstype, options, sensitiveOptions, nil /* mountFlags */)
 }
 
-// Unmount always returns an error on unsupported platforms
+// Unmount unmounts target with umount(8).
 func (mounter *Mounter) Unmount(target string) error {
 	klog.V(4).Infof("Unmounting %s", target)
 	command := exec.Command("umount", "-f", target)
@@ -87,7 +87,7 @@ func (mounter *Mounter) Unmount(target string) error {
 	return nil
 }
 
-// List always returns an error on unsupported platforms
+// List returns the mounted file systems, from getfsstat(2).
 func (mounter *Mounter) List() ([]MountPoint, error) {
 	count, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
 	if err != nil {
@@ -125,7 +125,6 @@ func (mounter *Mounter) CanSafelySkipMountPointCheck() bool {
 }
 
 // IsMountPoint determines if a directory is a mountpoint.
-// It always returns an error on unsupported platforms.
 func (mounter *Mounter) IsMountPoint(file string) (bool, error) {
 	isMnt, isMntErr := mountinfo.Mounted(file)
 	if isMntErr == nil {
@@ -191,12 +190,8 @@ func (mounter *SafeFormatAndMount) diskLooksUnformatted(disk string) (bool, erro
 	return true, errors.New("mount.diskLooksUnformatted unsupported")
 }
 
-// IsMountPoint determines if a directory is a mountpoint.
-// It always returns an error on unsupported platforms.
-func (mounter *SafeFormatAndMount) IsMountPoint(file string) (bool, error) {
-	//return false, errUnsupported
-	return false, errors.New("mount.IsMountPoint unsupported")
-}
+// SafeFormatAndMount has no IsMountPoint of its own (as on Linux): the embedded
+// Interface's applies. A stub here that always failed used to shadow it.
 
 // doMount runs the mount command. sensitiveOptions is an extension of options
 // except they will not be logged (because they may contain sensitive material)
