@@ -21,11 +21,12 @@ package mount
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
@@ -124,13 +125,104 @@ func (mounter *Mounter) CanSafelySkipMountPointCheck() bool {
 	return false
 }
 
-// IsMountPoint determines if a directory is a mountpoint.
+// IsMountPoint determines if a directory is a mountpoint, from the mount table
+// (getfsstat(2) without MNT_WAIT) rather than statfs(2) on the path: for an NFS
+// mount whose server is gone, statfs(2) and stat(2) on the mount point block
+// for good, and the kubelet could never tear the volume down. Only the parent
+// directory's symbolic links are resolved; the last component is the mount
+// point itself.
 func (mounter *Mounter) IsMountPoint(file string) (bool, error) {
-	isMnt, isMntErr := mountinfo.Mounted(file)
-	if isMntErr == nil {
-		return isMnt, nil
+	path, err := mountPointPath(file)
+	if err != nil {
+		return false, err
+	}
+	mps, err := mounter.List()
+	if err != nil {
+		return false, err
+	}
+	for _, mp := range mps {
+		if mp.Path == path {
+			return true, nil
+		}
+	}
+	// Not a mount point, so lstat(2) can't block on one; report a missing
+	// path like Linux does.
+	if _, err := os.Lstat(path); err != nil {
+		return false, err
 	}
 	return false, nil
+}
+
+// mountPointPath returns file as an absolute path with the symbolic links of
+// its parent directory resolved, without looking at file itself.
+func mountPointPath(file string) (string, error) {
+	abs, err := filepath.Abs(file)
+	if err != nil {
+		return "", err
+	}
+	if abs == "/" {
+		return abs, nil
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(abs)), nil
+}
+
+// mountTypeWithoutStat returns the file system type mounted at path, if path is
+// a mount point, from the mount table only (see IsMountPoint).
+func mountTypeWithoutStat(path string) (string, bool) {
+	p, err := mountPointPath(path)
+	if err != nil {
+		return "", false
+	}
+	mps, err := (&Mounter{}).List()
+	if err != nil {
+		return "", false
+	}
+	for _, mp := range mps {
+		if mp.Path == p {
+			return mp.Type, true
+		}
+	}
+	return "", false
+}
+
+// UnmountWithForce unmounts target. An NFS mount that isn't off after
+// umountTimeout - its server is gone, and umount(8) blocks looking the path up
+// - is dismounted with "umount -N", which cancels the outstanding RPCs without
+// a lookup of the path (also releasing the blocked umount). Other file systems
+// are unmounted as by Unmount.
+func (mounter *Mounter) UnmountWithForce(target string, umountTimeout time.Duration) error {
+	if fstype, _ := mountTypeWithoutStat(target); fstype != "nfs" {
+		return mounter.Unmount(target)
+	}
+	klog.V(4).Infof("Unmounting %s", target)
+	type result struct {
+		output []byte
+		err    error
+	}
+	done := make(chan result, 1)
+	command := exec.Command("umount", target)
+	go func() {
+		output, err := command.CombinedOutput()
+		done <- result{output, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return checkUmountError(target, command, r.output, r.err)
+		}
+		return nil
+	case <-time.After(umountTimeout):
+	}
+	klog.V(2).Infof("Timed out waiting for unmount of %s, dismounting it with umount -N", target)
+	force := exec.Command("umount", "-N", target)
+	if output, err := force.CombinedOutput(); err != nil {
+		return checkUmountError(target, force, output, err)
+	}
+	return nil
 }
 
 // GetMountRefs finds the other mount points of the directory pathname is, or

@@ -187,6 +187,11 @@ func isMountPointMatch(mp MountPoint, dir string) bool {
 // PathExists returns true if the specified path exists.
 // TODO: clean this up to use pkg/util/file/FileExists
 func PathExists(path string) (bool, error) {
+	// A mount point exists; don't stat(2) it where that can block for good
+	// (FreeBSD: an NFS mount whose server is gone).
+	if _, isMountPoint := mountTypeWithoutStat(path); isMountPoint {
+		return true, nil
+	}
 	_, err := os.Stat(path)
 	if err == nil {
 		return true, nil

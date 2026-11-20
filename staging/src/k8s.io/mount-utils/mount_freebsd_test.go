@@ -19,6 +19,8 @@ limitations under the License.
 package mount
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -66,5 +68,26 @@ func TestWithNFSRetryCount(t *testing.T) {
 		if got := withNFSRetryCount(tc.fstype, tc.options); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("withNFSRetryCount(%q, %v) = %v, want %v", tc.fstype, tc.options, got, tc.want)
 		}
+	}
+}
+
+func TestIsMountPointFromMountTable(t *testing.T) {
+	m := New("")
+	if isMnt, err := m.IsMountPoint("/"); err != nil || !isMnt {
+		t.Errorf("IsMountPoint(/) = %v, %v; want true", isMnt, err)
+	}
+	dir := t.TempDir()
+	if isMnt, err := m.IsMountPoint(dir); err != nil || isMnt {
+		t.Errorf("IsMountPoint(%s) = %v, %v; want false", dir, isMnt, err)
+	}
+	missing := filepath.Join(dir, "missing")
+	if _, err := m.IsMountPoint(missing); !os.IsNotExist(err) {
+		t.Errorf("IsMountPoint(%s) error = %v; want not exist", missing, err)
+	}
+	if fstype, ok := mountTypeWithoutStat("/"); !ok || fstype == "" {
+		t.Errorf("mountTypeWithoutStat(/) = %q, %v", fstype, ok)
+	}
+	if exists, err := PathExists("/"); err != nil || !exists {
+		t.Errorf("PathExists(/) = %v, %v", exists, err)
 	}
 }
