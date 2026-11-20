@@ -67,6 +67,9 @@ func (mounter *Mounter) MountSensitiveWithoutSystemdWithMountFlags(source string
 }
 
 func (mounter *Mounter) MountSensitive(source string, target string, fstype string, options []string, sensitiveOptions []string) error {
+	if socket := mountProxySocket(); socket != "" {
+		return mountThroughProxy(socket, source, target, fstype, append(append([]string(nil), options...), sensitiveOptions...))
+	}
 	if isBindMount(options) {
 		fstype = "nullfs"
 	}
@@ -79,6 +82,9 @@ func (mounter *Mounter) MountSensitive(source string, target string, fstype stri
 
 // Unmount unmounts target with umount(8).
 func (mounter *Mounter) Unmount(target string) error {
+	if socket := mountProxySocket(); socket != "" {
+		return unmountThroughProxy(socket, target)
+	}
 	klog.V(4).Infof("Unmounting %s", target)
 	command := exec.Command("umount", "-f", target)
 	output, err := command.CombinedOutput()
@@ -90,6 +96,9 @@ func (mounter *Mounter) Unmount(target string) error {
 
 // List returns the mounted file systems, from getfsstat(2).
 func (mounter *Mounter) List() ([]MountPoint, error) {
+	if socket := mountProxySocket(); socket != "" {
+		return listThroughProxy(socket)
+	}
 	count, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
 	if err != nil {
 		return nil, err
