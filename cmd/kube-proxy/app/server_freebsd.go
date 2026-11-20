@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	goruntime "runtime"
 	"time"
 
 	// Enable pprof HTTP handlers.
@@ -68,6 +69,11 @@ func (o *Options) platformApplyDefaults(config *proxyconfigapi.KubeProxyConfigur
 // platform-specific setup.
 func (s *ProxyServer) platformSetup(ctx context.Context) error {
 	logger := klog.FromContext(ctx)
+	// The conntrack settings, applied to pf's state table (Linux sets the
+	// nf_conntrack sysctls here).
+	if err := pf.SetStateOptions(ctx, exec.New(), &s.Config.Linux.Conntrack, goruntime.NumCPU()); err != nil {
+		return fmt.Errorf("could not set pf state options from kube-proxy configuration: %w", err)
+	}
 	if s.Config.DetectLocalMode == proxyconfigapi.LocalModeNodeCIDR {
 		logger.Info("Watching for node, awaiting podCIDR allocation", "hostname", s.NodeName)
 		node, err := waitForPodCIDR(ctx, s.Client, s.NodeName)
