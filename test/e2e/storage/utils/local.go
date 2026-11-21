@@ -113,7 +113,7 @@ func (l *ltrMgr) setupLocalVolumeTmpfs(ctx context.Context, node *v1.Node, param
 
 func (l *ltrMgr) cleanupLocalVolumeTmpfs(ctx context.Context, ltr *LocalTestResource) {
 	ginkgo.By(fmt.Sprintf("Unmount tmpfs mount point on node %q at path %q", ltr.Node.Name, ltr.Path))
-	err := l.hostExec.IssueCommand(ctx, fmt.Sprintf("umount %q", ltr.Path), ltr.Node)
+	err := l.hostExec.IssueCommand(ctx, unmount(ltr.Node, fmt.Sprintf("%q", ltr.Path)), ltr.Node)
 	framework.ExpectNoError(err)
 
 	ginkgo.By("Removing the test directory")
@@ -248,7 +248,7 @@ func (l *ltrMgr) setupLocalVolumeDirectoryBindMounted(ctx context.Context, node 
 func (l *ltrMgr) cleanupLocalVolumeDirectoryBindMounted(ctx context.Context, ltr *LocalTestResource) {
 	ginkgo.By("Removing the test directory")
 	hostDir := ltr.Path
-	removeCmd := fmt.Sprintf("umount %s && rm -r %s", hostDir, hostDir)
+	removeCmd := fmt.Sprintf("%s && rm -r %s", unmount(ltr.Node, hostDir), hostDir)
 	err := l.hostExec.IssueCommand(ctx, removeCmd, ltr.Node)
 	framework.ExpectNoError(err)
 }
@@ -269,7 +269,7 @@ func (l *ltrMgr) cleanupLocalVolumeDirectoryLinkBindMounted(ctx context.Context,
 	ginkgo.By("Removing the test directory")
 	hostDir := ltr.Path
 	hostDirBackend := hostDir + "-backend"
-	removeCmd := fmt.Sprintf("rm %s && umount %s && rm -r %s", hostDir, hostDirBackend, hostDirBackend)
+	removeCmd := fmt.Sprintf("rm %s && %s && rm -r %s", hostDir, unmount(ltr.Node, hostDirBackend), hostDirBackend)
 	err := l.hostExec.IssueCommand(ctx, removeCmd, ltr.Node)
 	framework.ExpectNoError(err)
 }
@@ -368,4 +368,19 @@ func bindMount(node *v1.Node) string {
 		return "mount -t nullfs"
 	}
 	return "mount --bind"
+}
+
+// unmount returns the command that unmounts path on node.
+//
+// The tests delete the pod without waiting and unmount the volume right away.
+// On Linux the source of a bind mount can be unmounted while the bind is still
+// in use. On FreeBSD the kubelet's nullfs mount of the volume holds the file
+// system below it busy (EBUSY) until the kubelet unmounts it, a few seconds
+// after the pod is gone, so retry for up to three minutes. Forcing the unmount
+// would pull the file system from under a pod that may still be running.
+func unmount(node *v1.Node, path string) string {
+	if node.Labels[v1.LabelOSStable] == "freebsd" {
+		return fmt.Sprintf("{ i=0; until umount %s; do i=$((i+1)); [ $i -lt 90 ] || exit 1; sleep 2; done; }", path)
+	}
+	return "umount " + path
 }
