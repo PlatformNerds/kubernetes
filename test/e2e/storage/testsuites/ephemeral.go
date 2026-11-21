@@ -214,6 +214,10 @@ func (p *ephemeralTestSuite) DefineTests(driver storageframework.TestDriver, pat
 			}
 			if pattern.VolMode == v1.PersistentVolumeBlock {
 				command = "if ! [ -b /mnt/test-0 ]; then echo /mnt/test-0 is not a block device; exit 1; fi"
+				// FreeBSD has no block devices: disks are character devices.
+				if e2evolume.PodOnFreeBSDNode(ctx, f.ClientSet, pod) {
+					command = "if ! [ -c /mnt/test-0 ]; then echo /mnt/test-0 is not a disk; exit 1; fi"
+				}
 			}
 			err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, command)
 			framework.ExpectNoError(err, "while checking read/write mount")
