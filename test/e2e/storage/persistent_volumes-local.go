@@ -1001,7 +1001,8 @@ func createWriteCmd(testDir string, testFile string, writeTestFileContent string
 		// sudo is not needed and does not exist in some containers (e.g. busybox), when using pod exec.
 		sudoCmd := fmt.Sprintf("SUDO_CMD=$(which sudo); echo ${SUDO_CMD}")
 		// Write the testFileContent into the block device.
-		writeBlockCmd := fmt.Sprintf("${SUDO_CMD} dd if=%s of=%s bs=512 count=100", testFilePath, testDir)
+		// conv=sync: whole sectors, which a raw disk (FreeBSD) needs.
+		writeBlockCmd := fmt.Sprintf("${SUDO_CMD} dd if=%s of=%s bs=512 count=100 conv=sync", testFilePath, testDir)
 		// Cleanup the file containing testFileContent.
 		deleteTestFileCmd := fmt.Sprintf("rm %s", testFilePath)
 		return fmt.Sprintf("%s && %s && %s && %s", writeTestFileCmd, sudoCmd, writeBlockCmd, deleteTestFileCmd)
@@ -1013,7 +1014,8 @@ func createWriteCmd(testDir string, testFile string, writeTestFileContent string
 func createReadCmd(testFileDir string, testFile string, volumeType localVolumeType) string {
 	if volumeType == BlockLocalVolumeType {
 		// Create the command to read the beginning of the block device and print it in ascii.
-		return fmt.Sprintf("hexdump -n 100 -e '100 \"%%_p\"' %s | head -1", testFileDir)
+		// Read a whole sector: a raw disk (FreeBSD) reads nothing less.
+		return fmt.Sprintf("dd if=%s bs=512 count=1 2>/dev/null | hexdump -n 100 -e '100 \"%%_p\"' | head -1", testFileDir)
 	}
 	// Create the command to read (aka cat) a file.
 	testFilePath := filepath.Join(testFileDir, testFile)

@@ -168,7 +168,9 @@ func (l *ltrMgr) teardownLoopDevice(ctx context.Context, dir string, node *v1.No
 	ginkgo.By(fmt.Sprintf("Tear down block device %q on node %q at path %s/file", loopDev, node.Name, dir))
 	losetupDeleteCmd := fmt.Sprintf("losetup -d %s", loopDev)
 	if isFreeBSD(node) {
-		losetupDeleteCmd = fmt.Sprintf("mdconfig -d -u %s", strings.TrimPrefix(loopDev, "/dev/"))
+		// losetup -d on a loop device still in use detaches it when it is
+		// released; mdconfig -d fails while the kubelet's mount holds it.
+		losetupDeleteCmd = fmt.Sprintf("{ i=0; until mdconfig -d -u %s; do i=$((i+1)); [ $i -lt 90 ] || exit 1; sleep 2; done; }", strings.TrimPrefix(loopDev, "/dev/"))
 	}
 	err := l.hostExec.IssueCommand(ctx, losetupDeleteCmd, node)
 	framework.ExpectNoError(err)

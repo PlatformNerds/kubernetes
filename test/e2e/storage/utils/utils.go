@@ -550,7 +550,8 @@ func CheckWriteToPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, 
 		pathForVolMode = filepath.Join(path, "file1.txt")
 	}
 
-	if nocache {
+	// A FreeBSD disk has no cache to bypass (and FreeBSD's dd no nocache).
+	if nocache && (volMode != v1.PersistentVolumeBlock || !e2evolume.PodOnFreeBSDNode(ctx, f.ClientSet, pod)) {
 		oflag = "oflag=nocache"
 	}
 
