@@ -688,9 +688,16 @@ func generateWriteFileCmd(content, fullPath string) []string {
 
 // CheckVolumeModeOfPath check mode of volume
 func CheckVolumeModeOfPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, volMode v1.PersistentVolumeMode, path string) error {
+	// FreeBSD has no block devices: disks are character devices.
+	blockTest := "-b"
+	if pod.Spec.NodeName != "" {
+		if node, err := f.ClientSet.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{}); err == nil && node.Labels[v1.LabelOSStable] == "freebsd" {
+			blockTest = "-c"
+		}
+	}
 	if volMode == v1.PersistentVolumeBlock {
 		// Check if block exists
-		if err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("test -b %s", path)); err != nil {
+		if err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("test %s %s", blockTest, path)); err != nil {
 			return err
 		}
 
@@ -705,7 +712,7 @@ func CheckVolumeModeOfPath(ctx context.Context, f *framework.Framework, pod *v1.
 		}
 
 		// Double check that it's not block
-		if err := e2epod.VerifyExecInPodFail(ctx, f, pod, fmt.Sprintf("test -b %s", path), 1); err != nil {
+		if err := e2epod.VerifyExecInPodFail(ctx, f, pod, fmt.Sprintf("test %s %s", blockTest, path), 1); err != nil {
 			return err
 		}
 	}

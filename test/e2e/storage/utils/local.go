@@ -132,6 +132,10 @@ func (l *ltrMgr) createAndSetupLoopDevice(ctx context.Context, dir string, node 
 	}
 	ddCmd := fmt.Sprintf("dd if=/dev/zero of=%s/file bs=4096 count=%d", dir, count)
 	losetupCmd := fmt.Sprintf("losetup -f %s/file", dir)
+	if isFreeBSD(node) {
+		// md(4) in vnode mode is FreeBSD's loop device.
+		losetupCmd = fmt.Sprintf("mdconfig -a -t vnode -f %s/file", dir)
+	}
 	err := l.hostExec.IssueCommand(ctx, fmt.Sprintf("%s && %s && %s", mkdirCmd, ddCmd, losetupCmd), node)
 	framework.ExpectNoError(err)
 }
@@ -139,6 +143,9 @@ func (l *ltrMgr) createAndSetupLoopDevice(ctx context.Context, dir string, node 
 // findLoopDevice finds loop device path by its associated storage directory.
 func (l *ltrMgr) findLoopDevice(ctx context.Context, dir string, node *v1.Node) string {
 	cmd := fmt.Sprintf("E2E_LOOP_DEV=$(losetup | grep %s/file | awk '{ print $1 }') 2>&1 > /dev/null && echo ${E2E_LOOP_DEV}", dir)
+	if isFreeBSD(node) {
+		cmd = fmt.Sprintf("mdconfig -lv | awk '$4 == \"%s/file\" { print \"/dev/\" $1 }'", dir)
+	}
 	loopDevResult, err := l.hostExec.IssueCommandWithResult(ctx, cmd, node)
 	framework.ExpectNoError(err)
 	return strings.TrimSpace(loopDevResult)
@@ -160,6 +167,9 @@ func (l *ltrMgr) teardownLoopDevice(ctx context.Context, dir string, node *v1.No
 	loopDev := l.findLoopDevice(ctx, dir, node)
 	ginkgo.By(fmt.Sprintf("Tear down block device %q on node %q at path %s/file", loopDev, node.Name, dir))
 	losetupDeleteCmd := fmt.Sprintf("losetup -d %s", loopDev)
+	if isFreeBSD(node) {
+		losetupDeleteCmd = fmt.Sprintf("mdconfig -d -u %s", strings.TrimPrefix(loopDev, "/dev/"))
+	}
 	err := l.hostExec.IssueCommand(ctx, losetupDeleteCmd, node)
 	framework.ExpectNoError(err)
 	return
@@ -179,6 +189,10 @@ func (l *ltrMgr) setupLocalVolumeBlockFS(ctx context.Context, node *v1.Node, par
 	loopDir := ltr.loopDir
 	// Format and mount at loopDir and give others rwx for read/write testing
 	cmd := fmt.Sprintf("mkfs -t ext4 %s && mount -t ext4 %s %s && chmod o+rwx %s", loopDev, loopDev, loopDir, loopDir)
+	if isFreeBSD(node) {
+		// mkfs.ext4 from e2fsprogs; FreeBSD's ext2fs mounts ext4.
+		cmd = fmt.Sprintf("mkfs.ext4 -q -F %s && mount -t ext2fs %s %s && chmod o+rwx %s", loopDev, loopDev, loopDir, loopDir)
+	}
 	err := l.hostExec.IssueCommand(ctx, cmd, node)
 	framework.ExpectNoError(err)
 	return &LocalTestResource{
@@ -189,7 +203,7 @@ func (l *ltrMgr) setupLocalVolumeBlockFS(ctx context.Context, node *v1.Node, par
 }
 
 func (l *ltrMgr) cleanupLocalVolumeBlockFS(ctx context.Context, ltr *LocalTestResource) {
-	umountCmd := fmt.Sprintf("umount %s", ltr.Path)
+	umountCmd := unmount(ltr.Node, ltr.Path)
 	err := l.hostExec.IssueCommand(ctx, umountCmd, ltr.Node)
 	framework.ExpectNoError(err)
 	l.cleanupLocalVolumeBlock(ctx, ltr)
@@ -363,6 +377,10 @@ func (l *ltrMgr) Remove(ctx context.Context, ltr *LocalTestResource) {
 
 // bindMount returns the command that bind-mounts a directory on node: FreeBSD's
 // bind mount is nullfs.
+func isFreeBSD(node *v1.Node) bool {
+	return node.Labels[v1.LabelOSStable] == "freebsd"
+}
+
 func bindMount(node *v1.Node) string {
 	if node.Labels[v1.LabelOSStable] == "freebsd" {
 		return "mount -t nullfs"

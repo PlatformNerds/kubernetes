@@ -19,7 +19,6 @@ limitations under the License.
 package mount
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -282,14 +281,6 @@ func nullfsMountRefs(path string, mps []MountPoint) []string {
 	return refs
 }
 
-func (mounter *SafeFormatAndMount) formatAndMountSensitive(source string, target string, fstype string, options []string, sensitiveOptions []string, formatOptions []string) error {
-	return mounter.Interface.Mount(source, target, fstype, options)
-}
-
-func (mounter *SafeFormatAndMount) diskLooksUnformatted(disk string) (bool, error) {
-	//return true, errUnsupported
-	return true, errors.New("mount.diskLooksUnformatted unsupported")
-}
 
 // SafeFormatAndMount has no IsMountPoint of its own (as on Linux): the embedded
 // Interface's applies. A stub here that always failed used to shadow it.
@@ -300,6 +291,7 @@ func (mounter *SafeFormatAndMount) diskLooksUnformatted(disk string) (bool, erro
 // mount.
 func (mounter *Mounter) doMount(mountCmd string, source string, target string, fstype string, options []string, sensitiveOptions []string, mountFlags []string) error {
 	options = withNFSRetryCount(fstype, options)
+	fstype = freeBSDFSType(fstype)
 	mountArgs, mountArgsLogStr := MakeMountArgsSensitiveWithMountFlags(source, target, fstype, options, sensitiveOptions, mountFlags)
 
 	// Logging with sensitive mount options removed.

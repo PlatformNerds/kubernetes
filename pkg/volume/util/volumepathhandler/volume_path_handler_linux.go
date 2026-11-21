@@ -233,3 +233,8 @@ func getDeviceMajorMinor(path string) (string, error) {
 
 	return fmt.Sprintf("%x:%x", major, minor), nil
 }
+
+// deviceBindMounts: the global map path bind-mounts the device.
+const deviceBindMounts = true
+
+func isDeviceSymlink(string) (bool, error) { return false, nil }

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 	utilpath "k8s.io/utils/path"
@@ -75,9 +76,16 @@ func (hu *HostUtil) DeviceOpened(pathname string) (bool, error) {
 	return false, nil
 }
 
-// PathIsDevice determines if a path is a device.
+// PathIsDevice determines if a path is a block device (see GetFileType).
 func (hu *HostUtil) PathIsDevice(pathname string) (bool, error) {
-	return false, nil
+	t, err := hu.GetFileType(pathname)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return t == FileTypeBlockDev, nil
 }
 
 // MakeRShared checks that given path is on a mount with 'rshared' mount
@@ -86,9 +94,56 @@ func (hu *HostUtil) MakeRShared(path string) error {
 	return nil
 }
 
-// GetFileType checks for sockets/block/character devices
+// GetFileType checks for sockets/block/character devices.
+//
+// FreeBSD has no block devices: disks are character devices in devfs. What
+// Linux calls a block device is a disk, so a character device that is a
+// GEOM provider (a disk, a partition, a label, an md(4) or a ZFS volume) is
+// a BlockDevice here, and HostPathType BlockDevice, local block volumes and
+// block-mode volumes work with them.
 func (hu *(HostUtil)) GetFileType(pathname string) (FileType, error) {
-	return getFileType(pathname)
+	t, err := getFileType(pathname)
+	if err != nil || t != FileTypeCharDev {
+		return t, err
+	}
+	if isGEOMProvider(pathname) {
+		return FileTypeBlockDev, nil
+	}
+	return t, nil
+}
+
+// isGEOMProvider reports whether pathname is a GEOM provider's device in a
+// devfs. It reads the GEOM configuration; it doesn't open the device.
+func isGEOMProvider(pathname string) bool {
+	resolved, err := filepath.EvalSymlinks(pathname)
+	if err != nil {
+		return false
+	}
+	var st unix.Statfs_t
+	if err := unix.Statfs(resolved, &st); err != nil || unix.ByteSliceToString(st.Fstypename[:]) != "devfs" {
+		return false
+	}
+	name, err := filepath.Rel(unix.ByteSliceToString(st.Mntonname[:]), resolved)
+	if err != nil {
+		return false
+	}
+	conf, err := unix.Sysctl("kern.geom.conftxt")
+	if err != nil {
+		return false
+	}
+	return geomProviderListed(conf, name)
+}
+
+// geomProviderListed reports whether kern.geom.conftxt lists a provider
+// called name ("<depth> <class> <name> <mediasize> ...").
+func geomProviderListed(conftxt, name string) bool {
+	for _, line := range strings.Split(conftxt, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && f[2] == name {
+			return true
+		}
+	}
+	return false
 }
 
 // PathExists checks whether the path exists

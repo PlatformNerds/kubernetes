@@ -102,7 +102,7 @@ func (v VolumePathHandler) MapDevice(devicePath string, mapPath string, linkName
 		return fmt.Errorf("failed to mkdir %s: %v", mapPath, err)
 	}
 
-	if bindMount {
+	if bindMount && deviceBindMounts {
 		return mapBindMountDevice(devicePath, mapPath, linkName)
 	}
 	return mapSymlinkDevice(devicePath, mapPath, linkName)
@@ -165,7 +165,7 @@ func (v VolumePathHandler) UnmapDevice(mapPath string, linkName string, bindMoun
 	klog.V(5).Infof("UnmapDevice: mapPath %s", mapPath)
 	klog.V(5).Infof("UnmapDevice: linkName %s", linkName)
 
-	if bindMount {
+	if bindMount && deviceBindMounts {
 		return unmapBindMountDevice(v, mapPath, linkName)
 	}
 	return unmapSymlinkDevice(v, mapPath, linkName)
@@ -262,6 +262,9 @@ func (v VolumePathHandler) IsSymlinkExist(mapPath string) (bool, error) {
 // If file doesn't exist, or file exists but not device, return false with no error.
 // On other cases, return false with error from Lstat().
 func (v VolumePathHandler) IsDeviceBindMountExist(mapPath string) (bool, error) {
+	if !deviceBindMounts {
+		return isDeviceSymlink(mapPath)
+	}
 	fi, err := os.Lstat(mapPath)
 	if err != nil {
 		// If file doesn't exist, return false and no error
@@ -288,7 +291,11 @@ func (v VolumePathHandler) GetDeviceBindMountRefs(devPath string, mapPath string
 		return nil, err
 	}
 	for _, file := range files {
-		if file.Type()&os.ModeDevice != os.ModeDevice {
+		if !deviceBindMounts {
+			if ok, _ := isDeviceSymlink(filepath.Join(mapPath, file.Name())); !ok {
+				continue
+			}
+		} else if file.Type()&os.ModeDevice != os.ModeDevice {
 			continue
 		}
 		filename := file.Name()
