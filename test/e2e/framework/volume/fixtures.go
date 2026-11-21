@@ -557,6 +557,10 @@ func testVolumeContent(ctx context.Context, f *framework.Framework, pod *v1.Pod,
 				// Filesystem: check fsType
 				if fsType != "" {
 					ginkgo.By("Checking fsType is correct.")
+					// FreeBSD mounts ext2, ext3 and ext4 with its ext2fs.
+					if (fsType == "ext2" || fsType == "ext3" || fsType == "ext4") && PodOnFreeBSDNode(ctx, f.ClientSet, pod) {
+						fsType = "ext2fs"
+					}
 					_, err = e2epodoutput.LookForStringInPodExecToContainer(pod.Namespace, pod.Name, containerName, []string{"grep", " " + dirName + " ", "/proc/mounts"}, fsType, time.Minute)
 					framework.ExpectNoError(err, "failed: getting the right fsType %s", fsType)
 				}
@@ -663,15 +667,19 @@ func generateWriteCmd(content, path string) []string {
 }
 
 // GenerateReadBlockCmd generates the corresponding command lines to read from a block device with the given file path.
+//
+// It reads whole sectors: a raw disk (FreeBSD has no buffered block devices)
+// only reads and writes them.
 func GenerateReadBlockCmd(fullPath string, numberOfCharacters int) []string {
-	var commands []string
-	commands = []string{"head", "-c", strconv.Itoa(numberOfCharacters), fullPath}
-	return commands
+	sectors := (numberOfCharacters + 511) / 512
+	return []string{"/bin/sh", "-c", fmt.Sprintf("dd if=%s bs=512 count=%d 2>/dev/null | head -c %d", fullPath, sectors, numberOfCharacters)}
 }
 
 // generateWriteBlockCmd generates the corresponding command lines to write to a block device the given content.
+//
+// It writes whole sectors, padded with zeros: see GenerateReadBlockCmd.
 func generateWriteBlockCmd(content, fullPath string) []string {
-	return generateWriteCmd(content, fullPath)
+	return []string{"/bin/sh", "-c", "echo '" + content + "' | dd of=" + fullPath + " bs=512 conv=sync 2>/dev/null; sync"}
 }
 
 // GenerateReadFileCmd generates the corresponding command lines to read from a file with the given file path.
@@ -686,14 +694,27 @@ func generateWriteFileCmd(content, fullPath string) []string {
 	return generateWriteCmd(content, fullPath)
 }
 
+// PodOnFreeBSDNode reports whether pod runs on a FreeBSD node.
+func PodOnFreeBSDNode(ctx context.Context, cs clientset.Interface, pod *v1.Pod) bool {
+	nodeName := pod.Spec.NodeName
+	if nodeName == "" {
+		if p, err := cs.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+			nodeName = p.Spec.NodeName
+		}
+	}
+	if nodeName == "" {
+		return false
+	}
+	node, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	return err == nil && node.Labels[v1.LabelOSStable] == "freebsd"
+}
+
 // CheckVolumeModeOfPath check mode of volume
 func CheckVolumeModeOfPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, volMode v1.PersistentVolumeMode, path string) error {
 	// FreeBSD has no block devices: disks are character devices.
 	blockTest := "-b"
-	if pod.Spec.NodeName != "" {
-		if node, err := f.ClientSet.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{}); err == nil && node.Labels[v1.LabelOSStable] == "freebsd" {
-			blockTest = "-c"
-		}
+	if PodOnFreeBSDNode(ctx, f.ClientSet, pod) {
+		blockTest = "-c"
 	}
 	if volMode == v1.PersistentVolumeBlock {
 		// Check if block exists

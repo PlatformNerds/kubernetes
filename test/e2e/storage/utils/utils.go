@@ -523,9 +523,15 @@ func CheckReadFromPath(ctx context.Context, f *framework.Framework, pod *v1.Pod,
 
 	sum := sha256.Sum256(genBinDataFromSeed(len, seed))
 
-	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("dd if=%s %s bs=%d count=1 | sha256sum", pathForVolMode, iflag, len))
+	// A raw disk reads whole sectors only (FreeBSD has no buffered block
+	// devices): read them and check the first len bytes.
+	read := fmt.Sprintf("dd if=%s %s bs=%d count=1", pathForVolMode, iflag, len)
+	if volMode == v1.PersistentVolumeBlock && len%512 != 0 {
+		read = fmt.Sprintf("dd if=%s %s bs=%d count=1 | head -c %d", pathForVolMode, iflag, roundUpToSector(len), len)
+	}
+	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("%s | sha256sum", read))
 	framework.ExpectNoError(err, "Failed to read from %s", pathForVolMode)
-	err = e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("dd if=%s %s bs=%d count=1 | sha256sum | grep -Fq %x", pathForVolMode, iflag, len, sum))
+	err = e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("%s | sha256sum | grep -Fq %x", read, sum))
 	framework.ExpectNoError(err, "Failed to read from %s", pathForVolMode)
 }
 
@@ -552,12 +558,24 @@ func CheckWriteToPath(ctx context.Context, f *framework.Framework, pod *v1.Pod, 
 
 	err := e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("echo %s | base64 -d | sha256sum", encoded))
 	framework.ExpectNoError(err, "Failed to generate sha256sum of encoded data")
-	err = e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("echo %s | base64 -d | dd of=%s %s bs=%d count=1", encoded, pathForVolMode, oflag, len))
+	// Whole sectors, padded with zeros, for a raw disk (see CheckReadFromPath).
+	write := fmt.Sprintf("dd of=%s %s bs=%d count=1", pathForVolMode, oflag, len)
+	if volMode == v1.PersistentVolumeBlock && len%512 != 0 {
+		write = fmt.Sprintf("dd of=%s %s bs=%d count=1 conv=sync", pathForVolMode, oflag, roundUpToSector(len))
+	}
+	err = e2epod.VerifyExecInPodSucceed(ctx, f, pod, fmt.Sprintf("echo %s | base64 -d | %s", encoded, write))
 	framework.ExpectNoError(err, "Failed to write to %s", pathForVolMode)
 }
 
+func roundUpToSector(n int) int { return (n + 511) / 512 * 512 }
+
 // GetSectorSize returns the sector size of the device.
 func GetSectorSize(ctx context.Context, f *framework.Framework, pod *v1.Pod, device string) int {
+	if e2evolume.PodOnFreeBSDNode(ctx, f.ClientSet, pod) {
+		// No blockdev(8) on FreeBSD. The test disks are md(4) vnode disks,
+		// whose sectors are 512 bytes unless mdconfig -S says otherwise.
+		return 512
+	}
 	stdout, _, err := e2epod.ExecShellInPodWithFullOutput(ctx, f, pod.Name, fmt.Sprintf("blockdev --getss %s", device))
 	framework.ExpectNoError(err, "Failed to get sector size of %s", device)
 	ss, err := strconv.Atoi(stdout)
