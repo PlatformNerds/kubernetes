@@ -19,12 +19,16 @@ package utils
 import (
 	"context"
 	"fmt"
+	"net"
+	"os"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/exec"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2essh "k8s.io/kubernetes/test/e2e/framework/ssh"
 )
 
 // Result holds the execution result of remote execution command.
@@ -138,6 +142,9 @@ func (h *hostExecutor) exec(ctx context.Context, cmd string, node *v1.Node) (Res
 		Host: node.Name,
 		Cmd:  cmd,
 	}
+	if node.Labels[v1.LabelOSStable] == "freebsd" {
+		return h.sshExec(ctx, cmd, node)
+	}
 	pod, ok := h.nodeExecPods[node.Name]
 	if !ok {
 		pod = h.launchNodeExecPod(ctx, node.Name)
@@ -167,6 +174,52 @@ func (h *hostExecutor) exec(ctx context.Context, cmd string, node *v1.Node) (Res
 		PreserveWhitespace: true,
 	})
 	return result, err
+}
+
+// sshExec runs cmd as root on a FreeBSD node over SSH.
+//
+// The hostexec pod reaches the host by entering PID 1's mount namespace with
+// nsenter. FreeBSD has no namespaces: a container is a jail, and a jailed
+// process can't leave its jail. SSH gives the same thing, a root shell on the
+// node, so the commands see the node's own file systems and their mounts are
+// the node's. It needs the provider's SSH key (LOCAL_SSH_KEY for "local") and
+// KUBE_SSH_USER; a user other than root runs the command through sudo.
+func (h *hostExecutor) sshExec(ctx context.Context, cmd string, node *v1.Node) (Result, error) {
+	result := Result{Host: node.Name, Cmd: cmd}
+	addr := ""
+	for _, a := range node.Status.Addresses {
+		if a.Type == v1.NodeInternalIP && a.Address != "" {
+			addr = a.Address
+			break
+		}
+	}
+	if addr == "" {
+		return result, fmt.Errorf("node %q has no internal IP to SSH to", node.Name)
+	}
+	user := os.Getenv("KUBE_SSH_USER")
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+	remote := "sh -c " + shellQuote(cmd)
+	if user != "root" {
+		remote = "sudo -n " + remote
+	}
+	r, err := e2essh.SSH(ctx, remote, net.JoinHostPort(addr, e2essh.SSHPort), framework.TestContext.Provider)
+	result.Stdout, result.Stderr, result.Code = r.Stdout, r.Stderr, r.Code
+	if err != nil {
+		return result, fmt.Errorf("ssh to node %q: %w", node.Name, err)
+	}
+	if r.Code != 0 {
+		return result, exec.CodeExitError{
+			Err:  fmt.Errorf("command %q on node %q exited with %d: %s", cmd, node.Name, r.Code, r.Stderr),
+			Code: r.Code,
+		}
+	}
+	return result, nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // IssueCommandWithResult issues command on the given node and returns stdout as

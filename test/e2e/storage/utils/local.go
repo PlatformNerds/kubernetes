@@ -236,7 +236,7 @@ func (l *ltrMgr) cleanupLocalVolumeDirectoryLink(ctx context.Context, ltr *Local
 
 func (l *ltrMgr) setupLocalVolumeDirectoryBindMounted(ctx context.Context, node *v1.Node, parameters map[string]string) *LocalTestResource {
 	hostDir := l.getTestDir()
-	cmd := fmt.Sprintf("mkdir -p %s && mount --bind %s %s", hostDir, hostDir, hostDir)
+	cmd := fmt.Sprintf("mkdir -p %s && %s %s %s", hostDir, bindMount(node), hostDir, hostDir)
 	err := l.hostExec.IssueCommand(ctx, cmd, node)
 	framework.ExpectNoError(err)
 	return &LocalTestResource{
@@ -256,7 +256,7 @@ func (l *ltrMgr) cleanupLocalVolumeDirectoryBindMounted(ctx context.Context, ltr
 func (l *ltrMgr) setupLocalVolumeDirectoryLinkBindMounted(ctx context.Context, node *v1.Node, parameters map[string]string) *LocalTestResource {
 	hostDir := l.getTestDir()
 	hostDirBackend := hostDir + "-backend"
-	cmd := fmt.Sprintf("mkdir -p %s && mount --bind %s %s && ln -s %s %s", hostDirBackend, hostDirBackend, hostDirBackend, hostDirBackend, hostDir)
+	cmd := fmt.Sprintf("mkdir -p %s && %s %s %s && ln -s %s %s", hostDirBackend, bindMount(node), hostDirBackend, hostDirBackend, hostDirBackend, hostDir)
 	err := l.hostExec.IssueCommand(ctx, cmd, node)
 	framework.ExpectNoError(err)
 	return &LocalTestResource{
@@ -359,4 +359,13 @@ func (l *ltrMgr) Remove(ctx context.Context, ltr *LocalTestResource) {
 		framework.Failf("Failed to remove local test resource, unsupported volume type: %v is specified", ltr.VolumeType)
 	}
 	return
+}
+
+// bindMount returns the command that bind-mounts a directory on node: FreeBSD's
+// bind mount is nullfs.
+func bindMount(node *v1.Node) string {
+	if node.Labels[v1.LabelOSStable] == "freebsd" {
+		return "mount -t nullfs"
+	}
+	return "mount --bind"
 }
