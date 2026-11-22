@@ -185,6 +185,25 @@ func doBindSubPath(mounter mount.Interface, subpath Subpath) (hostPath string, e
 	subpath.VolumePath = newVolumePath
 	subpath.Path = newPath
 
+	// The subpath may go through symlinks the pod created in its volume; they
+	// must not lead out of it (CVE-2017-1002101), or the container gets the host
+	// path they name.
+	if !mount.PathWithinBase(newPath, newVolumePath) {
+		return "", fmt.Errorf("subpath %q not within volume path %q", newPath, newVolumePath)
+	}
+	// Open it without following symlinks, to compare with what gets mounted:
+	// nullfs can't mount a file descriptor, and mount(8) resolves the path
+	// again, after a component may have been swapped for a symlink.
+	fd, err := doSafeOpen(newPath, newVolumePath)
+	if err != nil {
+		return "", fmt.Errorf("error opening subpath %v: %v", newPath, err)
+	}
+	defer syscall.Close(fd)
+	var want unix.Stat_t
+	if err := unix.Fstat(fd, &want); err != nil {
+		return "", fmt.Errorf("error running fstat on subpath %v: %v", newPath, err)
+	}
+
 	alreadyMounted, bindPathTarget, err := prepareSubpathTarget(mounter, subpath)
 	if err != nil {
 		return "", err
@@ -210,6 +229,15 @@ func doBindSubPath(mounter mount.Interface, subpath Subpath) (hostPath string, e
 	klog.V(5).Infof("nullfs mounting %q at %q", subpath.Path, bindPathTarget)
 	if err = mounter.MountSensitiveWithoutSystemdWithMountFlags(subpath.Path, bindPathTarget, "nullfs", options, nil /* sensitiveOptions */, mountFlags); err != nil {
 		return "", fmt.Errorf("error mounting %s: %s", subpath.Path, err)
+	}
+	// nullfs passes the inode number and generation of the file below through
+	// (not the device). The mount is now fixed to that file.
+	var got unix.Stat_t
+	if err := unix.Stat(bindPathTarget, &got); err != nil {
+		return "", fmt.Errorf("error running stat on %s: %v", bindPathTarget, err)
+	}
+	if got.Ino != want.Ino || got.Gen != want.Gen || got.Mode&unix.S_IFMT != want.Mode&unix.S_IFMT {
+		return "", fmt.Errorf("subpath %s changed while it was mounted", subpath.Path)
 	}
 	success = true
 
