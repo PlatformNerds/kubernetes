@@ -39,9 +39,14 @@ import (
 // MountProxySocketEnv overrides where the proxy's socket is looked for.
 const MountProxySocketEnv = "BSDK8S_MOUNT_PROXY"
 
+// The proxy listens in the kubelet's plugins/ and in plugins/kubernetes.io/csi/:
+// many node plugins mount only the latter (the kubelet's staging directory)
+// and their own plugins/<driver>/, not all of plugins/.
 var mountProxySockets = []string{
 	"/var/db/kubelet/plugins/bsdk8s-mount-proxy.sock",
 	"/var/lib/kubelet/plugins/bsdk8s-mount-proxy.sock",
+	"/var/db/kubelet/plugins/kubernetes.io/csi/bsdk8s-mount-proxy.sock",
+	"/var/lib/kubelet/plugins/kubernetes.io/csi/bsdk8s-mount-proxy.sock",
 }
 
 type mountProxyRequest struct {
