@@ -16,8 +16,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// containerManagerImpl implements container manager on FreeBSD.
-// Only GetNodeAllocatableReservation() and GetCapacity() are implemented now.
+// containerManagerImpl implements container manager on FreeBSD: capacity and
+// allocatable, device plugins and Dynamic Resource Allocation. There are no
+// cgroups: the runtime enforces limits with rctl(8).
 
 package cm
 
@@ -34,21 +35,24 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/server/healthz"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	pluginwatcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
-	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager"
+	"k8s.io/kubernetes/pkg/kubelet/cm/dra"
 	"k8s.io/kubernetes/pkg/kubelet/cm/memorymanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
@@ -65,12 +69,12 @@ type containerManagerImpl struct {
 	deviceManager devicemanager.Manager
 	// Interface for Topology resource co-ordination
 	topologyManager topologymanager.Manager
-}
-
-type noopResourceAllocator struct{}
-
-func (ra *noopResourceAllocator) Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
-	return admission.GetPodAdmitResult(nil)
+	// Dynamic Resource Allocation: prepares ResourceClaims through the DRA
+	// drivers' kubelet plugins and hands their CDI devices to the runtime.
+	// nil when the DynamicResourceAllocation feature is off.
+	draManager *dra.Manager
+	// Updates of the device manager and the DRA manager, merged.
+	resourceUpdates chan resourceupdates.Update
 }
 
 func (cm *containerManagerImpl) Start(ctx context.Context, node *v1.Node,
@@ -94,6 +98,12 @@ func (cm *containerManagerImpl) Start(ctx context.Context, node *v1.Node,
 
 	containerMap, containerRunningSet := buildContainerMapAndRunningSetFromRuntime(ctx, runtimeService)
 
+	if cm.draManager != nil {
+		if err := cm.draManager.Start(ctx, dra.ActivePodsFunc(activePods), dra.GetNodeFunc(getNode), sourcesReady); err != nil {
+			return fmt.Errorf("start dra manager error: %w", err)
+		}
+	}
+
 	// Starts device manager.
 	if err := cm.deviceManager.Start(klog.FromContext(ctx), devicemanager.ActivePodsFunc(activePods), sourcesReady, containerMap, containerRunningSet); err != nil {
 		return err
@@ -103,9 +113,13 @@ func (cm *containerManagerImpl) Start(ctx context.Context, node *v1.Node,
 }
 
 func (cm *containerManagerImpl) GetPluginRegistrationHandlers() map[string]cache.PluginHandler {
-	return map[string]cache.PluginHandler{
+	res := map[string]cache.PluginHandler{
 		pluginwatcherapi.DevicePlugin: cm.deviceManager.GetWatcherHandler(),
 	}
+	if cm.draManager != nil {
+		res[pluginwatcherapi.DRAPlugin] = cm.draManager.GetWatcherHandler()
+	}
+	return res
 }
 
 // NewContainerManager creates FreeBSD container manager.
@@ -127,7 +141,14 @@ func NewContainerManager(ctx context.Context, mountUtil mount.Interface, cadviso
 		cadvisorInterface: cadvisorInterface,
 	}
 
-	cm.topologyManager = topologymanager.NewFakeManager()
+	// The "none" policy: no NUMA alignment, but its admit handler has the
+	// device manager allocate devices to the pod's containers (the fake
+	// manager admitted without, so device plugin devices never reached a
+	// container).
+	cm.topologyManager, err = topologymanager.NewManager(nil, topologymanager.PolicyNone, "", nil)
+	if err != nil {
+		return nil, err
+	}
 
 	logger.Info("Creating device plugin manager")
 	cm.deviceManager, err = devicemanager.NewManagerImpl(nil, cm.topologyManager)
@@ -135,6 +156,38 @@ func NewContainerManager(ctx context.Context, mountUtil mount.Interface, cadviso
 		return nil, err
 	}
 	cm.topologyManager.AddHintProvider(logger, cm.deviceManager)
+
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DynamicResourceAllocation) {
+		logger.Info("Creating Dynamic Resource Allocation (DRA) manager")
+		cm.draManager, err = dra.NewManager(logger, kubeClient, nodeConfig.KubeletRootDir)
+		if err != nil {
+			return nil, err
+		}
+		metrics.RegisterCollectors(cm.draManager.NewMetricsCollector())
+	}
+
+	// One channel for the kubelet's sync loop, fed by the device manager
+	// and (with ResourceHealthStatus) the DRA manager, as on Linux.
+	cm.resourceUpdates = make(chan resourceupdates.Update, 10)
+	sources := map[string]<-chan resourceupdates.Update{"deviceManager": cm.deviceManager.Updates()}
+	if cm.draManager != nil && utilfeature.DefaultFeatureGate.Enabled(kubefeatures.ResourceHealthStatus) {
+		sources["draManager"] = cm.draManager.Updates()
+	}
+	var wg sync.WaitGroup
+	for name, ch := range sources {
+		wg.Add(1)
+		go func(name string, c <-chan resourceupdates.Update) {
+			defer wg.Done()
+			for v := range c {
+				logger.V(4).Info("Container Manager: forwarding resource update", "source", name, "pods", v.PodUIDs)
+				cm.resourceUpdates <- v
+			}
+		}(name, ch)
+	}
+	go func() {
+		wg.Wait()
+		close(cm.resourceUpdates)
+	}()
 
 	return cm, nil
 }
@@ -301,6 +354,14 @@ func (cm *containerManagerImpl) GetHealthCheckers() []healthz.HealthChecker {
 
 func (cm *containerManagerImpl) GetResources(ctx context.Context, pod *v1.Pod, container *v1.Container) (*kubecontainer.RunContainerOptions, error) {
 	opts := &kubecontainer.RunContainerOptions{}
+	if cm.draManager != nil {
+		resOpts, err := cm.draManager.GetResources(pod, container)
+		if err != nil {
+			return nil, err
+		}
+		klog.FromContext(ctx).V(5).Info("Determined CDI devices for pod", "pod", klog.KObj(pod), "cdiDevices", resOpts.CDIDevices)
+		opts.CDIDevices = append(opts.CDIDevices, resOpts.CDIDevices...)
+	}
 	// Allocate should already be called during predicateAdmitHandler.Admit(),
 	// just try to fetch device runtime information from cached state here
 	devOpts, err := cm.deviceManager.GetDeviceRunContainerOptions(ctx, pod, container)
@@ -313,6 +374,7 @@ func (cm *containerManagerImpl) GetResources(ctx context.Context, pod *v1.Pod, c
 	opts.Mounts = append(opts.Mounts, devOpts.Mounts...)
 	opts.Envs = append(opts.Envs, devOpts.Envs...)
 	opts.Annotations = append(opts.Annotations, devOpts.Annotations...)
+	opts.CDIDevices = append(opts.CDIDevices, devOpts.CDIDevices...)
 	return opts, nil
 }
 
@@ -322,7 +384,7 @@ func (cm *containerManagerImpl) UpdatePluginResources(node *schedulerframework.N
 
 func (cm *containerManagerImpl) InternalContainerLifecycle() InternalContainerLifecycle {
 	logger := klog.TODO()
-	return &internalContainerLifecycleImpl{cpumanager.NewFakeManager(logger), memorymanager.NewFakeManager(logger), topologymanager.NewFakeManager()}
+	return &internalContainerLifecycleImpl{cpumanager.NewFakeManager(logger), memorymanager.NewFakeManager(logger), cm.topologyManager}
 }
 
 func (cm *containerManagerImpl) GetPodCgroupRoot() string {
@@ -342,7 +404,7 @@ func (cm *containerManagerImpl) ShouldResetExtendedResourceCapacity() bool {
 }
 
 func (cm *containerManagerImpl) GetAllocateResourcesPodAdmitHandler() lifecycle.PodAdmitHandler {
-	return &noopResourceAllocator{}
+	return cm.topologyManager
 }
 
 func (cm *containerManagerImpl) UpdateAllocatedDevices() {
@@ -369,28 +431,74 @@ func (cm *containerManagerImpl) GetNodeAllocatableAbsolute() v1.ResourceList {
 	return nil
 }
 
+// GetDynamicResources reports a container's DRA devices to the pod resources
+// API, as on Linux.
 func (cm *containerManagerImpl) GetDynamicResources(pod *v1.Pod, container *v1.Container) []*podresourcesapi.DynamicResource {
-	return nil
+	if cm.draManager == nil {
+		return []*podresourcesapi.DynamicResource{}
+	}
+	containerClaimInfos, err := cm.draManager.GetContainerClaimInfos(pod, container)
+	if err != nil {
+		klog.TODO().Error(err, "Unable to get container claim info state")
+		return []*podresourcesapi.DynamicResource{}
+	}
+	var containerDynamicResources []*podresourcesapi.DynamicResource
+	for _, containerClaimInfo := range containerClaimInfos {
+		var claimResources []*podresourcesapi.ClaimResource
+		for driverName, driverState := range containerClaimInfo.DriverState {
+			var cdiDevices []*podresourcesapi.CDIDevice
+			for _, device := range driverState.Devices {
+				for _, cdiDeviceID := range device.CDIDeviceIDs {
+					cdiDevices = append(cdiDevices, &podresourcesapi.CDIDevice{Name: cdiDeviceID})
+				}
+				claimResources = append(claimResources, &podresourcesapi.ClaimResource{
+					CdiDevices: cdiDevices,
+					DriverName: driverName,
+					PoolName:   device.PoolName,
+					DeviceName: device.DeviceName,
+					ShareId:    (*string)(device.ShareID),
+				})
+			}
+		}
+		containerDynamicResources = append(containerDynamicResources, &podresourcesapi.DynamicResource{
+			ClaimName:      containerClaimInfo.ClaimName,
+			ClaimNamespace: containerClaimInfo.Namespace,
+			ClaimResources: claimResources,
+		})
+	}
+	return containerDynamicResources
 }
 
 func (cm *containerManagerImpl) UpdateAllocatedResourcesStatus(pod *v1.Pod, status *v1.PodStatus) {
 	cm.deviceManager.UpdateAllocatedResourcesStatus(pod, status)
+	if cm.draManager != nil && utilfeature.DefaultFeatureGate.Enabled(kubefeatures.ResourceHealthStatus) {
+		cm.draManager.UpdateAllocatedResourcesStatus(pod, status)
+	}
 }
 
 func (cm *containerManagerImpl) Updates() <-chan resourceupdates.Update {
-	return cm.deviceManager.Updates()
+	return cm.resourceUpdates
 }
 
 func (cm *containerManagerImpl) PrepareDynamicResources(ctx context.Context, pod *v1.Pod) error {
-	return nil
+	if cm.draManager == nil {
+		return nil
+	}
+	return cm.draManager.PrepareResources(ctx, pod)
 }
 
 func (cm *containerManagerImpl) UnprepareDynamicResources(ctx context.Context, pod *v1.Pod) error {
-	return nil
+	if cm.draManager == nil {
+		return nil
+	}
+	return cm.draManager.UnprepareResources(ctx, pod)
 }
 
 func (cm *containerManagerImpl) PodMightNeedToUnprepareResources(UID types.UID) bool {
-	return false
+	if cm.draManager == nil {
+		return false
+	}
+	return cm.draManager.PodMightNeedToUnprepareResources(UID)
 }
 
 // FreeBSDPodContainerManagerForTest gives tests in other packages the FreeBSD
