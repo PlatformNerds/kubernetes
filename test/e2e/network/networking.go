@@ -19,6 +19,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -26,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilwait "k8s.io/apimachinery/pkg/util/wait"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/pkg/cluster/ports"
 	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
@@ -564,6 +566,22 @@ var _ = common.SIGDescribe("Networking", func() {
 		podNames, svcIP, err := StartServeHostnameService(ctx, f.ClientSet, getServeHostnameService(svc), ns, numPods)
 		framework.ExpectNoError(err, "failed to create replication controller with service: %s in the namespace: %s", svc, ns)
 
+		if sshHostIsFreeBSD(ctx, f.ClientSet, host) {
+			// kube-proxy's pf proxier keeps each Service's rules in an
+			// anchor below cni-rdr; empty them all. The kubelet sets up no
+			// firewall rules on FreeBSD, so there is nothing of its own to
+			// check.
+			ginkgo.By("flushing all kube-proxy pf anchors on node " + host)
+			result, err := e2essh.SSH(ctx, `for a in $(sudo pfctl -a cni-rdr -s Anchors 2>/dev/null | grep kube-svc-); do sudo pfctl -a "$a" -F all; done`, host, framework.TestContext.Provider)
+			if err != nil || result.Code != 0 {
+				e2essh.LogResult(result)
+				framework.Failf("couldn't flush pf anchors: %v", err)
+			}
+			ginkgo.By("verifying that kube-proxy rules are eventually recreated")
+			framework.ExpectNoError(verifyServeHostnameServiceUp(ctx, f.ClientSet, ns, podNames, svcIP, servicePort))
+			return
+		}
+
 		// Ideally we want to reload the system firewall, but we don't necessarily
 		// know how to do that on this system ("firewall-cmd --reload"? "systemctl
 		// restart iptables"?). So instead we just manually delete all "KUBE-"
@@ -663,3 +681,22 @@ var _ = common.SIGDescribe("Networking", func() {
 		}
 	})
 })
+
+// sshHostIsFreeBSD reports whether host (an address from
+// e2essh.NodeSSHHosts, with its port) belongs to a FreeBSD node.
+func sshHostIsFreeBSD(ctx context.Context, c clientset.Interface, host string) bool {
+	addr, _, err := net.SplitHostPort(host)
+	if err != nil {
+		addr = host
+	}
+	nodes, err := c.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	framework.ExpectNoError(err)
+	for _, node := range nodes.Items {
+		for _, a := range node.Status.Addresses {
+			if a.Address == addr {
+				return node.Labels[v1.LabelOSStable] == "freebsd"
+			}
+		}
+	}
+	return false
+}
