@@ -418,3 +418,15 @@ func TestCheckSCTPPorts(t *testing.T) {
 		})
 	}
 }
+
+func TestParseServiceAnchors(t *testing.T) {
+	out := "  cni-rdr/kube-svc-v4-AAAA\n  cni-rdr/kube-svc-v4-BBBB\n  cni-rdr/other\n\n"
+	got := parseServiceAnchors(out)
+	want := sets.New[string]("cni-rdr/kube-svc-v4-AAAA", "cni-rdr/kube-svc-v4-BBBB")
+	if !got.Equal(want) {
+		t.Errorf("parseServiceAnchors() = %v, want %v", sets.List(got), sets.List(want))
+	}
+	if missing := want.Difference(parseServiceAnchors("  cni-rdr/kube-svc-v4-AAAA\n")); !missing.Equal(sets.New[string]("cni-rdr/kube-svc-v4-BBBB")) {
+		t.Errorf("missing anchors = %v", sets.List(missing))
+	}
+}

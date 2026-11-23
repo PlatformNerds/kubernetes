@@ -123,6 +123,9 @@ type Proxier struct {
 	initialized          int32
 	syncRunner           *runner.BoundedFrequencyRunner // governs calls to syncProxyRules
 	syncPeriod           time.Duration
+	// syncedAnchors are the Service anchors pf listed after the last
+	// sync; checkAnchors resyncs when one of them is gone.
+	syncedAnchors sets.Set[string]
 
 	// These are effectively const and do not need the mutex to be held.
 	exec          utilexec.Interface
@@ -184,6 +187,7 @@ func NewProxier(ctx context.Context,
 		endpointsMap:        make(proxy.EndpointsMap),
 		endpointsChanges:    proxy.NewEndpointsChangeTracker(ipFamily, nodeName, newEndpointInfo, nil),
 		needFullSync:        true,
+		syncPeriod:          syncPeriod,
 		exec:                exec,
 		localDetector:       localDetector,
 		nodeName:            nodeName,
@@ -253,30 +257,76 @@ func NewDualStackProxier(
 	return metaproxier.NewMetaProxier(ipv4Proxier, ipv6Proxier), nil
 }
 
+// listServiceAnchors returns the Service anchors (cni-rdr/kube-svc-*) that
+// pf lists. pf lists an anchor only while it holds rules.
+func listServiceAnchors(exec utilexec.Interface) (sets.Set[string], error) {
+	out, err := exec.Command("pfctl", "-a", "cni-rdr", "-s", "Anchors").Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseServiceAnchors(string(out)), nil
+}
+
+func parseServiceAnchors(out string) sets.Set[string] {
+	anchors := sets.New[string]()
+	for _, anchor := range strings.Split(out, "\n") {
+		anchor = strings.TrimSpace(anchor)
+		if strings.HasPrefix(anchor, "cni-rdr/kube-svc-") {
+			anchors.Insert(anchor)
+		}
+	}
+	return anchors
+}
+
 // CleanupLeftovers removes all pf rules created by the Proxier It returns true
 // if an error was encountered. Errors are logged.
 func CleanupLeftovers(exec utilexec.Interface) (encounteredError bool) {
 	klog.V(2).Info("listing PF anchors")
-	cmd := exec.Command("pfctl", "-a", "cni-rdr", "-s", "Anchors")
-	out, err := cmd.Output()
+	anchors, err := listServiceAnchors(exec)
 	if err != nil {
 		klog.Errorf("listing PF anchors: %v", err)
 		return true
 	}
 
 	encounteredError = false
-	anchors := strings.Split(string(out), "\n")
-	for _, anchor := range anchors {
-		anchor = strings.TrimSpace(anchor)
-		if strings.HasPrefix(anchor, "cni-rdr/kube-svc-") {
-			klog.V(2).Infof("deleting PF anchor %s", anchor)
-			if err := flushAnchor(exec, anchor); err != nil {
-				klog.Errorf("deleting anchor %s: %v", anchor, err)
-				encounteredError = true
-			}
+	for _, anchor := range sets.List(anchors) {
+		klog.V(2).Infof("deleting PF anchor %s", anchor)
+		if err := flushAnchor(exec, anchor); err != nil {
+			klog.Errorf("deleting anchor %s: %v", anchor, err)
+			encounteredError = true
 		}
 	}
 	return encounteredError
+}
+
+// checkAnchors resyncs when a Service anchor that pf listed after the last
+// sync is gone (its rules flushed, e.g. by "pfctl -a ... -F all"). The
+// proxier only rewrites its rules on changes and once per FullSyncPeriod;
+// this is what the iptables and nftables proxiers' canary chain monitors do
+// for theirs.
+func (proxier *Proxier) checkAnchors() {
+	proxier.mu.Lock()
+	synced := proxier.syncedAnchors
+	var current sets.Set[string]
+	var err error
+	if synced.Len() > 0 {
+		current, err = listServiceAnchors(proxier.exec)
+	}
+	proxier.mu.Unlock()
+	if synced.Len() == 0 {
+		return
+	}
+	if err != nil {
+		proxier.logger.V(2).Info("Listing PF anchors failed", "err", err)
+		return
+	}
+	if missing := synced.Difference(current); missing.Len() > 0 {
+		proxier.logger.Info("PF rules of Services were removed, resyncing", "anchors", missing.Len())
+		proxier.mu.Lock()
+		proxier.needFullSync = true
+		proxier.mu.Unlock()
+		proxier.Sync()
+	}
 }
 
 // Sync is called to synchronize the proxier state to pf as soon as possible.
@@ -297,6 +347,9 @@ func (proxier *Proxier) SyncLoop() {
 
 	// synthesize "last change queued" time as the informers are syncing.
 	metrics.SyncProxyRulesLastQueuedTimestamp.WithLabelValues(string(proxier.ipFamily)).SetToCurrentTime()
+	if proxier.syncPeriod > 0 {
+		go wait.Until(proxier.checkAnchors, proxier.syncPeriod, wait.NeverStop)
+	}
 	proxier.syncRunner.Loop(wait.NeverStop)
 }
 
@@ -1122,6 +1175,11 @@ func (proxier *Proxier) syncProxyRules() error {
 		if err := flushAnchor(proxier.exec, "cni-rdr/"+a); err != nil {
 			klog.Errorf("error flushing rules, err: %v", err)
 		}
+	}
+	if anchors, err := listServiceAnchors(proxier.exec); err == nil {
+		proxier.syncedAnchors = anchors
+	} else {
+		proxier.logger.V(2).Info("Listing PF anchors failed", "err", err)
 	}
 
 	// Without this, /healthz and /livez report kube-proxy unhealthy from
