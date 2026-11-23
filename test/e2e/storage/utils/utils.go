@@ -75,7 +75,19 @@ func VerifyFSGroupInPod(ctx context.Context, f *framework.Framework, filePath, e
 }
 
 // getKubeletRunning return if the kubelet is running or not
-func getKubeletRunning(ctx context.Context, nodeIP string) bool {
+func getKubeletRunning(ctx context.Context, nodeIP string, freebsd bool) bool {
+	if freebsd {
+		// "service kubelet status" exits 0 while the kubelet runs, 1 if not.
+		command := "service kubelet status"
+		if isSudoPresent(ctx, nodeIP, framework.TestContext.Provider) {
+			command = "sudo " + command
+		}
+		framework.Logf("Attempting `%s`", command)
+		sshResult, err := e2essh.SSH(ctx, command, nodeIP, framework.TestContext.Provider)
+		framework.ExpectNoError(err, fmt.Sprintf("SSH to Node %q errored.", nodeIP))
+		e2essh.LogResult(sshResult)
+		return sshResult.Code == 0
+	}
 	command := "systemctl show kubelet --property ActiveState --value"
 	framework.Logf("Attempting `%s`", command)
 	sshResult, err := e2essh.SSH(ctx, command, nodeIP, framework.TestContext.Provider)
@@ -134,6 +146,11 @@ func TestVolumeUnmountsFromDeletedPodWithForceOption(ctx context.Context, c clie
 	nodeIP, err := getHostAddress(ctx, c, clientPod)
 	framework.ExpectNoError(err)
 	nodeIP = nodeIP + ":22"
+	// The host's mount table: FreeBSD has no /proc/self/mountinfo.
+	mountTableCmd := "cat /proc/self/mountinfo"
+	if podNodeIsFreeBSD(ctx, c, clientPod) {
+		mountTableCmd = "mount"
+	}
 
 	ginkgo.By("Expecting the volume mount to be found.")
 	result, err := e2essh.SSH(ctx, fmt.Sprintf("mount | grep %s | grep -v volume-subpaths", clientPod.UID), nodeIP, framework.TestContext.Provider)
@@ -143,7 +160,7 @@ func TestVolumeUnmountsFromDeletedPodWithForceOption(ctx context.Context, c clie
 
 	if checkSubpath {
 		ginkgo.By("Expecting the volume subpath mount to be found.")
-		result, err := e2essh.SSH(ctx, fmt.Sprintf("cat /proc/self/mountinfo | grep %s | grep volume-subpaths", clientPod.UID), nodeIP, framework.TestContext.Provider)
+		result, err := e2essh.SSH(ctx, fmt.Sprintf("%s | grep %s | grep volume-subpaths", mountTableCmd, clientPod.UID), nodeIP, framework.TestContext.Provider)
 		e2essh.LogResult(result)
 		framework.ExpectNoError(err, "Encountered SSH error.")
 		gomega.Expect(result.Code).To(gomega.Equal(0), fmt.Sprintf("Expected grep exit code of 0, got %d", result.Code))
@@ -218,7 +235,7 @@ func TestVolumeUnmountsFromDeletedPodWithForceOption(ctx context.Context, c clie
 
 	if checkSubpath {
 		ginkgo.By("Expecting the volume subpath mount not to be found.")
-		result, err = e2essh.SSH(ctx, fmt.Sprintf("cat /proc/self/mountinfo | grep %s | grep volume-subpaths", clientPod.UID), nodeIP, framework.TestContext.Provider)
+		result, err = e2essh.SSH(ctx, fmt.Sprintf("%s | grep %s | grep volume-subpaths", mountTableCmd, clientPod.UID), nodeIP, framework.TestContext.Provider)
 		e2essh.LogResult(result)
 		framework.ExpectNoError(err, "Encountered SSH error.")
 		gomega.Expect(result.Stdout).To(gomega.BeEmpty(), "Expected grep stdout to be empty (i.e. no subpath mount found).")
@@ -245,13 +262,13 @@ func TestVolumeUnmapsFromDeletedPodWithForceOption(ctx context.Context, c client
 	nodeIP = nodeIP + ":22"
 
 	// Creating command to check whether path exists
-	podDirectoryCmd := fmt.Sprintf("ls /var/lib/kubelet/pods/%s/volumeDevices/*/ | grep '.'", clientPod.UID)
+	podDirectoryCmd := fmt.Sprintf("ls %s/pods/%s/volumeDevices/*/ | grep '.'", framework.TestContext.KubeletRootDir, clientPod.UID)
 	if isSudoPresent(ctx, nodeIP, framework.TestContext.Provider) {
 		podDirectoryCmd = fmt.Sprintf("sudo sh -c \"%s\"", podDirectoryCmd)
 	}
 	// Directories in the global directory have unpredictable names, however, device symlinks
 	// have the same name as pod.UID. So just find anything with pod.UID name.
-	globalBlockDirectoryCmd := fmt.Sprintf("find /var/lib/kubelet/plugins -name %s", clientPod.UID)
+	globalBlockDirectoryCmd := fmt.Sprintf("find %s/plugins -name %s", framework.TestContext.KubeletRootDir, clientPod.UID)
 	if isSudoPresent(ctx, nodeIP, framework.TestContext.Provider) {
 		globalBlockDirectoryCmd = fmt.Sprintf("sudo sh -c \"%s\"", globalBlockDirectoryCmd)
 	}
@@ -587,10 +604,15 @@ func GetSectorSize(ctx context.Context, f *framework.Framework, pod *v1.Pod, dev
 
 // findMountPoints returns all mount points on given node under specified directory.
 func findMountPoints(ctx context.Context, hostExec HostExec, node *v1.Node, dir string) []string {
-	result, err := hostExec.IssueCommandWithResult(ctx, fmt.Sprintf(`find %s -type d -exec mountpoint {} \; | grep 'is a mountpoint$' || true`, dir), node)
+	cmd := fmt.Sprintf(`find %s -type d -exec mountpoint {} \; | grep 'is a mountpoint$' || true`, dir)
+	if isFreeBSD(node) {
+		// No mountpoint(1): list the mount table's mount points below dir.
+		cmd = fmt.Sprintf(`mount -p | awk '{ print $2 }' | grep '^%s/' | sed 's/$/ is a mountpoint/' || true`, strings.TrimSuffix(dir, "/"))
+	}
+	result, err := hostExec.IssueCommandWithResult(ctx, cmd, node)
 	framework.ExpectNoError(err, "Encountered HostExec error.")
 	var mountPoints []string
-	if err != nil {
+	if err == nil {
 		for _, line := range strings.Split(result, "\n") {
 			if line == "" {
 				continue
@@ -603,7 +625,7 @@ func findMountPoints(ctx context.Context, hostExec HostExec, node *v1.Node, dir 
 
 // FindVolumeGlobalMountPoints returns all volume global mount points on the node of given pod.
 func FindVolumeGlobalMountPoints(ctx context.Context, hostExec HostExec, node *v1.Node) sets.String {
-	return sets.NewString(findMountPoints(ctx, hostExec, node, "/var/lib/kubelet/plugins")...)
+	return sets.NewString(findMountPoints(ctx, hostExec, node, framework.TestContext.KubeletRootDir+"/plugins")...)
 }
 
 // CreateDriverNamespace creates a namespace for CSI driver installation.

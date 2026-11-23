@@ -111,6 +111,11 @@ func KubeletCommand(ctx context.Context, kOp KubeletOpt, c clientset.Interface, 
 	nodeIP = nodeIP + ":22"
 
 	commandTemplate := "systemctl %s kubelet"
+	freebsd := podNodeIsFreeBSD(ctx, c, pod)
+	if freebsd {
+		// rc.d service; status exits 0 only while it runs.
+		commandTemplate = "service kubelet %s"
+	}
 	sudoPresent := isSudoPresent(ctx, nodeIP, framework.TestContext.Provider)
 	if sudoPresent {
 		commandTemplate = "sudo " + commandTemplate
@@ -132,7 +137,7 @@ func KubeletCommand(ctx context.Context, kOp KubeletOpt, c clientset.Interface, 
 		return
 	}
 
-	if kOp == KStart && getKubeletRunning(ctx, nodeIP) {
+	if kOp == KStart && getKubeletRunning(ctx, nodeIP, freebsd) {
 		framework.Logf("Kubelet is already running on node %q", pod.Spec.NodeName)
 		// Just skip. Or we cannot get a new heartbeat in time.
 		return
@@ -149,6 +154,14 @@ func KubeletCommand(ctx context.Context, kOp KubeletOpt, c clientset.Interface, 
 	if ok := e2enode.WaitForNodeToBeReady(ctx, c, pod.Spec.NodeName, NodeStateTimeout); !ok {
 		framework.Failf("Node %s failed to enter Ready state", pod.Spec.NodeName)
 	}
+}
+
+// podNodeIsFreeBSD reports whether the pod's node runs FreeBSD, whose host
+// commands differ (rc.d services, mount(8) instead of /proc/self/mountinfo).
+func podNodeIsFreeBSD(ctx context.Context, c clientset.Interface, pod *v1.Pod) bool {
+	node, err := c.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
+	framework.ExpectNoError(err)
+	return isFreeBSD(node)
 }
 
 // getHostAddress gets the node for a pod and returns the first
