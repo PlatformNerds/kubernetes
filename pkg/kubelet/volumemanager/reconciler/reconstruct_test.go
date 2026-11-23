@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -223,6 +224,79 @@ func TestCleanOrphanVolumes(t *testing.T) {
 				t.Errorf("Error waiting for volumes to get unmounted: %s: %s", err, lastErr)
 			}
 		})
+	}
+}
+
+// TestCleanOrphanVolumesRetries checks that a volume that failed
+// reconstruction is cleaned up again while its directory is still on disk
+// (its first unmount can fail while a deleted pod's containers still hold
+// it), and dropped once the directory is gone.
+func TestCleanOrphanVolumesRetries(t *testing.T) {
+	tmpKubeletDir := t.TempDir()
+	tmpKubeletPodDir := filepath.Join(tmpKubeletDir, "pods")
+	volumePath := filepath.Join(tmpKubeletPodDir, "pod1uid", "volumes", "fake-plugin", "volume-name")
+	if err := os.MkdirAll(volumePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	vol := podVolume{
+		podName:        "pod1uid",
+		volumeSpecName: "volume-name",
+		volumePath:     volumePath,
+		// No such plugin: every cleanup fails, as an unmount of a busy
+		// volume would, and nothing removes the directory.
+		pluginName: "missing-plugin",
+		volumeMode: v1.PersistentVolumeFilesystem,
+	}
+	rc, _ := getReconciler(tmpKubeletDir, t, []string{}, nil /*custom kubeclient*/)
+	rcInstance, _ := rc.(*reconciler)
+	rcInstance.volumesFailedReconstruction = []podVolume{vol}
+	logger, _ := ktesting.NewTestContext(t)
+
+	rcInstance.cleanOrphanVolumes(logger)
+	if len(rcInstance.volumesFailedReconstruction) != 1 {
+		t.Fatalf("Expected the volume to be kept for a retry while %s exists, got %+v", volumePath, rcInstance.volumesFailedReconstruction)
+	}
+	key := "pod1uid/volume-name"
+	attempt := rcInstance.orphanCleanupAttempts[key]
+
+	// Within the retry period nothing is tried again.
+	rcInstance.cleanOrphanVolumes(logger)
+	if got := rcInstance.orphanCleanupAttempts[key]; got != attempt {
+		t.Errorf("Expected no new attempt within %v, got %+v", orphanCleanupRetryPeriod, got)
+	}
+
+	// After the period it is tried again.
+	attempt.last = attempt.last.Add(-orphanCleanupRetryPeriod)
+	rcInstance.orphanCleanupAttempts[key] = attempt
+	rcInstance.cleanOrphanVolumes(logger)
+	if got := rcInstance.orphanCleanupAttempts[key]; !got.last.After(attempt.last) {
+		t.Errorf("Expected a new attempt after %v, got %+v", orphanCleanupRetryPeriod, got)
+	}
+
+	// Once the directory is gone the volume is dropped.
+	if err := os.RemoveAll(volumePath); err != nil {
+		t.Fatal(err)
+	}
+	attempt = rcInstance.orphanCleanupAttempts[key]
+	attempt.last = attempt.last.Add(-orphanCleanupRetryPeriod)
+	rcInstance.orphanCleanupAttempts[key] = attempt
+	rcInstance.cleanOrphanVolumes(logger)
+	if len(rcInstance.volumesFailedReconstruction) != 0 || len(rcInstance.orphanCleanupAttempts) != 0 {
+		t.Errorf("Expected the volume to be dropped, got %+v %+v", rcInstance.volumesFailedReconstruction, rcInstance.orphanCleanupAttempts)
+	}
+
+	// A volume whose cleanup keeps failing is given up after the window.
+	if err := os.MkdirAll(volumePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rcInstance.volumesFailedReconstruction = []podVolume{vol}
+	rcInstance.orphanCleanupAttempts[key] = orphanCleanupAttempt{
+		first: time.Now().Add(-orphanCleanupRetryWindow - time.Second),
+		last:  time.Now().Add(-orphanCleanupRetryPeriod),
+	}
+	rcInstance.cleanOrphanVolumes(logger)
+	if len(rcInstance.volumesFailedReconstruction) != 0 {
+		t.Errorf("Expected the volume to be given up after %v, got %+v", orphanCleanupRetryWindow, rcInstance.volumesFailedReconstruction)
 	}
 }
 

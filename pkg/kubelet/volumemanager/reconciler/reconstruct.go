@@ -18,6 +18,8 @@ package reconciler
 
 import (
 	"context"
+	"os"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -145,26 +147,77 @@ func (rc *reconciler) updateStates(logger klog.Logger, reconstructedVolumes map[
 	}
 }
 
+const (
+	// orphanCleanupRetryPeriod and orphanCleanupRetryWindow bound the
+	// retries of a failed cleanup of a volume that failed reconstruction.
+	orphanCleanupRetryPeriod = 10 * time.Second
+	orphanCleanupRetryWindow = 5 * time.Minute
+)
+
+type orphanCleanupAttempt struct {
+	first, last time.Time
+}
+
 // cleanOrphanVolumes tries to clean up all volumes that failed reconstruction.
+//
+// The cleanup runs right after the kubelet starts, possibly before the
+// containers of a pod that was deleted meanwhile are killed. Where the
+// containers' mounts keep the volume busy (FreeBSD: a container's nullfs
+// mount of a subPath holds the kubelet's mount below it, while a Linux mount
+// namespace holds copies), the unmount fails once. So a volume whose
+// directory is still there is tried again every orphanCleanupRetryPeriod,
+// for orphanCleanupRetryWindow.
 func (rc *reconciler) cleanOrphanVolumes(logger klog.Logger) {
 	if len(rc.volumesFailedReconstruction) == 0 {
 		return
 	}
 
+	now := time.Now()
+	remaining := make([]podVolume, 0)
 	for _, volume := range rc.volumesFailedReconstruction {
+		key := string(volume.podName) + "/" + volume.volumeSpecName
 		if rc.desiredStateOfWorld.VolumeExistsWithSpecName(volume.podName, volume.volumeSpecName) {
 			// Some pod needs the volume, don't clean it up and hope that
 			// reconcile() calls SetUp and reconstructs the volume in ASW.
 			logger.V(4).Info("Volume exists in desired state, skip cleaning up mounts", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName)
+			delete(rc.orphanCleanupAttempts, key)
 			continue
+		}
+		attempt, retry := rc.orphanCleanupAttempts[key]
+		if retry {
+			if _, err := os.Lstat(volume.volumePath); err != nil {
+				logger.V(2).Info("Volume that could not be reconstructed is cleaned up", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName)
+				delete(rc.orphanCleanupAttempts, key)
+				continue
+			}
+			if now.Sub(attempt.first) > orphanCleanupRetryWindow {
+				logger.Info("Giving up cleaning up mounts for volume that could not be reconstructed", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName, "volumePath", volume.volumePath)
+				delete(rc.orphanCleanupAttempts, key)
+				continue
+			}
+			if now.Sub(attempt.last) < orphanCleanupRetryPeriod {
+				remaining = append(remaining, volume)
+				continue
+			}
+			attempt.last = now
+		} else {
+			attempt = orphanCleanupAttempt{first: now, last: now}
 		}
 		logger.Info("Cleaning up mounts for volume that could not be reconstructed", "podName", volume.podName, "volumeSpecName", volume.volumeSpecName)
 		rc.cleanupMounts(logger, volume)
+		if _, err := os.Lstat(volume.volumePath); err != nil {
+			// Nothing left on disk to retry.
+			delete(rc.orphanCleanupAttempts, key)
+			continue
+		}
+		rc.orphanCleanupAttempts[key] = attempt
+		remaining = append(remaining, volume)
 	}
 
-	logger.V(2).Info("Orphan volume cleanup finished")
-	// Clean the cache, cleanup is one shot operation.
-	rc.volumesFailedReconstruction = make([]podVolume, 0)
+	if len(remaining) == 0 {
+		logger.V(2).Info("Orphan volume cleanup finished")
+	}
+	rc.volumesFailedReconstruction = remaining
 }
 
 // updateReconstructedFromNodeStatus tries to file devicePaths of reconstructed volumes from

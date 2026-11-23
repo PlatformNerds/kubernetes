@@ -120,6 +120,7 @@ func NewReconciler(
 		timeOfLastSync:                  time.Time{},
 		volumesFailedReconstruction:     make([]podVolume, 0),
 		volumesNeedUpdateFromNodeStatus: make([]v1.UniqueVolumeName, 0),
+		orphanCleanupAttempts:           map[string]orphanCleanupAttempt{},
 	}
 }
 
@@ -143,6 +144,9 @@ type reconciler struct {
 	timeOfLastSync                  time.Time
 	volumesFailedReconstruction     []podVolume
 	volumesNeedUpdateFromNodeStatus []v1.UniqueVolumeName
+	// orphanCleanupAttempts tracks the retries of cleanOrphanVolumes, by
+	// pod and volume spec name.
+	orphanCleanupAttempts map[string]orphanCleanupAttempt
 }
 
 func (rc *reconciler) unmountVolumes(logger klog.Logger) {
