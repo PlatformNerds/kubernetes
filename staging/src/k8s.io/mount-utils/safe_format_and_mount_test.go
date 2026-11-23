@@ -222,6 +222,9 @@ func TestSafeFormatAndMount(t *testing.T) {
 		fakeMounter := ErrorMounter{NewFakeMounter(nil), 0, test.mountErrs}
 		fakeExec := &testingexec.FakeExec{ExactOrder: true}
 		for _, script := range test.execScripts {
+			if runtime.GOOS == "freebsd" {
+				script = freeBSDExecArgs(script)
+			}
 			fakeCmd := &testingexec.FakeCmd{}
 			cmdAction := makeFakeCmd(fakeCmd, script.command, script.args...)
 			outputAction := makeFakeOutput(script.output, script.err)
@@ -283,6 +286,19 @@ func TestSafeFormatAndMount(t *testing.T) {
 			}
 		}
 	}
+}
+
+// freeBSDExecArgs maps the Linux commands the cases expect to the ones the
+// FreeBSD formatter runs (mount_format_freebsd.go): ext file systems are
+// checked with e2fsck in preen mode, and mkfs.xfs gets no -f.
+func freeBSDExecArgs(e ExecArgs) ExecArgs {
+	switch {
+	case e.command == "fsck" && len(e.args) == 2 && e.args[0] == "-a":
+		e.command, e.args = "e2fsck", []string{"-p", e.args[1]}
+	case e.command == "mkfs.xfs" && len(e.args) > 0 && e.args[0] == "-f":
+		e.args = e.args[1:]
+	}
+	return e
 }
 
 func makeFakeCmd(fakeCmd *testingexec.FakeCmd, cmd string, args ...string) testingexec.FakeCommandAction {

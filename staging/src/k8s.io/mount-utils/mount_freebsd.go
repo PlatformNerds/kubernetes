@@ -281,7 +281,6 @@ func nullfsMountRefs(path string, mps []MountPoint) []string {
 	return refs
 }
 
-
 // SafeFormatAndMount has no IsMountPoint of its own (as on Linux): the embedded
 // Interface's applies. A stub here that always failed used to shadow it.
 
