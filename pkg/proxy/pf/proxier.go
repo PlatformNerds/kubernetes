@@ -153,6 +153,11 @@ type Proxier struct {
 	sctpRdrPorts func() (bool, error)
 	sctpWarned   sets.Set[string]
 
+	// outboundSticky: pf keeps sticky-address mappings right for outbound
+	// rdr-to (kern.features.pf_rdr_out_sticky), so sessionAffinity can be
+	// honoured for the node's own connections too.
+	outboundSticky bool
+
 	logger klog.Logger
 }
 
@@ -199,6 +204,7 @@ func NewProxier(ctx context.Context,
 		nodePortAddresses:   nodePortAddresses,
 		networkInterfacer:   proxyutil.RealNetwork{},
 		sctpRdrPorts:        pfSCTPRdrPorts,
+		outboundSticky:      pfOutboundSticky(),
 		sctpWarned:          sets.New[string](),
 		logger:              logger,
 	}
@@ -790,7 +796,7 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 		}
 	}
 	if r.internal != nil {
-		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal)
+		proxier.hostRedirectRule(af, proto, "any", r.clusterIP, r.port, r.internal, r.sticky)
 	} else {
 		// internalTrafficPolicy: Local and no local endpoint: drop,
 		// as on Linux, rather than send it to the default route.
@@ -800,13 +806,13 @@ func (proxier *Proxier) writeServiceRules(r *serviceRules) {
 	for _, d := range dests {
 		if nodeTarget != nil {
 			if d.isNodePort {
-				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget)
+				proxier.hostNodePortRule(af, proto, d.ip, d.port, nodeTarget, r.sticky)
 			} else {
 				source := "any"
 				if d.firewalled {
 					source = lbSourceTable
 				}
-				proxier.hostRedirectRule(af, proto, source, d.ip, d.port, nodeTarget)
+				proxier.hostRedirectRule(af, proto, source, d.ip, d.port, nodeTarget, r.sticky)
 			}
 		}
 		// externalTrafficPolicy: Local and no local endpoint: drop,
@@ -950,12 +956,12 @@ func (proxier *Proxier) hairpinSNATRule(af, proto string, endpointIP string, tar
 // address validation drops unless pf delivers them (the bsdk8s pf change
 // "deliver replies of redirected connections to the host's own address");
 // on other kernels this rule is harmless: such connections failed anyway.
-func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, t *pfTarget) {
+func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePort int, t *pfTarget, sticky bool) {
 	proxier.splitRedirect([]interface{}{
 		"pass out quick on lo0", af, "proto", proto,
 		"from any to", nodeIP.String(),
 		"port", strconv.Itoa(nodePort),
-	}, t, false)
+	}, t, sticky && proxier.outboundSticky)
 }
 
 // hostRedirectRule redirects traffic the node itself sends to a ClusterIP
@@ -968,16 +974,17 @@ func (proxier *Proxier) hostNodePortRule(af, proto string, nodeIP net.IP, nodePo
 // the address of the interface the Service CIDR routes through, so on a
 // multi-homed node route the Service CIDR via the node IP's interface.
 //
-// No sticky-address: pf (15.x) records the wrong address for outbound rdr-to
-// source tracking and would redirect every later connection of a client to
-// the client itself (fixed by the bsdk8s pf patch, not yet upstream), so
+// sticky-address only where the kernel says it works for outbound rdr-to
+// (kern.features.pf_rdr_out_sticky, the bsdk8s pf fix, not yet upstream):
+// stock 15.x pf records the client's own address for these and would redirect
+// every later connection of a client to the client itself. Without it,
 // sessionAffinity is not honoured for host-network clients.
-func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, t *pfTarget) {
+func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP net.IP, destinationPort int, t *pfTarget, sticky bool) {
 	proxier.splitRedirect([]interface{}{
 		"pass out quick", af, "proto", proto,
 		"from", source, "to", destinationIP.String(),
 		"port", strconv.Itoa(destinationPort),
-	}, t, false)
+	}, t, sticky && proxier.outboundSticky)
 }
 
 // flushAnchor removes all translation and filter rules of an anchor. Not

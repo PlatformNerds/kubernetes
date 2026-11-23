@@ -58,12 +58,29 @@ func TestRedirectRule(t *testing.T) {
 
 func TestHostRedirectRule(t *testing.T) {
 	p := &Proxier{pfData: proxyutil.NewLineBuffer()}
-	p.hostRedirectRule("inet", "udp", "any", net.ParseIP("10.96.0.10"), 53, target(nil, []string{"10.244.0.206", "10.244.0.207"}, 53))
-	p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.1"), 443, target(nil, []string{"192.168.100.1"}, 6443))
+	p.hostRedirectRule("inet", "udp", "any", net.ParseIP("10.96.0.10"), 53, target(nil, []string{"10.244.0.206", "10.244.0.207"}, 53), false)
+	p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.1"), 443, target(nil, []string{"192.168.100.1"}, 6443), false)
 	want := "pass out quick inet proto udp from any to 10.96.0.10 port 53 rdr-to { 10.244.0.206, 10.244.0.207 } port 53 round-robin\n" +
 		"pass out quick inet proto tcp from any to 10.96.0.1 port 443 rdr-to { 192.168.100.1 } port 6443 round-robin\n"
 	if got := p.pfData.String(); got != want {
 		t.Errorf("got  %q\nwant %q", got, want)
+	}
+
+	// sessionAffinity: sticky-address only on kernels whose pf handles it
+	// for outbound rdr-to.
+	for _, kernelFix := range []bool{false, true} {
+		p := &Proxier{pfData: proxyutil.NewLineBuffer(), outboundSticky: kernelFix}
+		p.hostRedirectRule("inet", "tcp", "any", net.ParseIP("10.96.0.20"), 80, target(nil, []string{"10.244.0.5", "10.244.1.6"}, 8080), true)
+		p.hostNodePortRule("inet", "tcp", net.ParseIP("192.168.100.1"), 30080, target(nil, []string{"10.244.0.5", "10.244.1.6"}, 8080), true)
+		sticky := ""
+		if kernelFix {
+			sticky = " sticky-address"
+		}
+		want := "pass out quick inet proto tcp from any to 10.96.0.20 port 80 rdr-to { 10.244.0.5, 10.244.1.6 } port 8080 round-robin" + sticky + "\n" +
+			"pass out quick on lo0 inet proto tcp from any to 192.168.100.1 port 30080 rdr-to { 10.244.0.5, 10.244.1.6 } port 8080 round-robin" + sticky + "\n"
+		if got := p.pfData.String(); got != want {
+			t.Errorf("outboundSticky=%v:\ngot  %q\nwant %q", kernelFix, got, want)
+		}
 	}
 }
 

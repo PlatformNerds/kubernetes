@@ -26,3 +26,10 @@ func pfSCTPRdrPorts() (bool, error) {
 	v, err := unix.SysctlUint32("net.pf.sctp_rdr_ports")
 	return err == nil && v != 0, err
 }
+
+// pfOutboundSticky reports whether pf's sticky-address works with outbound
+// rdr-to (kern.features.pf_rdr_out_sticky, set by kernels with the fix).
+func pfOutboundSticky() bool {
+	v, err := unix.SysctlUint32("kern.features.pf_rdr_out_sticky")
+	return err == nil && v != 0
+}

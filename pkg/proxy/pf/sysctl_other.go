@@ -23,3 +23,5 @@ import "errors"
 func pfSCTPRdrPorts() (bool, error) {
 	return false, errors.New("pf is FreeBSD-only")
 }
+
+func pfOutboundSticky() bool { return false }
