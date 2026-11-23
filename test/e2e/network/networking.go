@@ -568,11 +568,12 @@ var _ = common.SIGDescribe("Networking", func() {
 
 		if sshHostIsFreeBSD(ctx, f.ClientSet, host) {
 			// kube-proxy's pf proxier keeps each Service's rules in an
-			// anchor below cni-rdr; empty them all. The kubelet sets up no
+			// anchor below cni-rdr; empty them all ("-F all" also tries
+			// to flush what an anchor can't hold and fails). The kubelet sets up no
 			// firewall rules on FreeBSD, so there is nothing of its own to
 			// check.
 			ginkgo.By("flushing all kube-proxy pf anchors on node " + host)
-			result, err := e2essh.SSH(ctx, `for a in $(sudo pfctl -a cni-rdr -s Anchors 2>/dev/null | grep kube-svc-); do sudo pfctl -a "$a" -F all; done`, host, framework.TestContext.Provider)
+			result, err := e2essh.SSH(ctx, `for a in $(sudo pfctl -a cni-rdr -s Anchors 2>/dev/null | grep kube-svc-); do sudo pfctl -a "$a" -F nat && sudo pfctl -a "$a" -F rules || exit 1; done`, host, framework.TestContext.Provider)
 			if err != nil || result.Code != 0 {
 				e2essh.LogResult(result)
 				framework.Failf("couldn't flush pf anchors: %v", err)
