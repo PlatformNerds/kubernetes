@@ -84,6 +84,12 @@ func TestIsMountPointFromMountTable(t *testing.T) {
 	if _, err := m.IsMountPoint(missing); !os.IsNotExist(err) {
 		t.Errorf("IsMountPoint(%s) error = %v; want not exist", missing, err)
 	}
+	if notMnt, err := m.IsLikelyNotMountPoint(missing); !notMnt || !os.IsNotExist(err) {
+		t.Errorf("IsLikelyNotMountPoint(%s) = %v, %v; want true, not exist", missing, notMnt, err)
+	}
+	if notMnt, err := m.IsLikelyNotMountPoint("/"); notMnt || err != nil {
+		t.Errorf("IsLikelyNotMountPoint(/) = %v, %v; want false", notMnt, err)
+	}
 	if fstype, ok := mountTypeWithoutStat("/"); !ok || fstype == "" {
 		t.Errorf("mountTypeWithoutStat(/) = %q, %v", fstype, ok)
 	}

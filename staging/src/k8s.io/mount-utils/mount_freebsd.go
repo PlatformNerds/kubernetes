@@ -120,10 +120,14 @@ func (mounter *Mounter) List() ([]MountPoint, error) {
 	return res, nil
 }
 
+// IsLikelyNotMountPoint reports true with the error when file can't be
+// checked, a missing path included, as Linux does: callers such as the CSI
+// plugin's isDirMounted accept os.IsNotExist and use the boolean, and false
+// there meant "mounted", so the volume directory was never removed.
 func (mounter *Mounter) IsLikelyNotMountPoint(file string) (bool, error) {
 	isMountPoint, err := mounter.IsMountPoint(file)
 	if err != nil {
-		return false, err
+		return true, err
 	}
 	return !isMountPoint, nil
 }
