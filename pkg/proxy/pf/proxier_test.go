@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/proxy"
 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
@@ -428,5 +429,15 @@ func TestParseServiceAnchors(t *testing.T) {
 	}
 	if missing := want.Difference(parseServiceAnchors("  cni-rdr/kube-svc-v4-AAAA\n")); !missing.Equal(sets.New[string]("cni-rdr/kube-svc-v4-BBBB")) {
 		t.Errorf("missing anchors = %v", sets.List(missing))
+	}
+}
+
+func TestFamilyAnchors(t *testing.T) {
+	all := sets.New[string]("cni-rdr/kube-svc-v4-AAAA", "cni-rdr/kube-svc-v6-BBBB")
+	for family, want := range map[v1.IPFamily]string{v1.IPv4Protocol: "cni-rdr/kube-svc-v4-AAAA", v1.IPv6Protocol: "cni-rdr/kube-svc-v6-BBBB"} {
+		p := &Proxier{ipFamily: family}
+		if got := p.familyAnchors(all); !got.Equal(sets.New[string](want)) {
+			t.Errorf("%s: familyAnchors() = %v, want %v", family, sets.List(got), want)
+		}
 	}
 }

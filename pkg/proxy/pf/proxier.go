@@ -267,6 +267,18 @@ func listServiceAnchors(exec utilexec.Interface) (sets.Set[string], error) {
 	return parseServiceAnchors(string(out)), nil
 }
 
+// familyAnchors returns the anchors of this proxier's IP family (anchorName).
+func (proxier *Proxier) familyAnchors(anchors sets.Set[string]) sets.Set[string] {
+	prefix := "cni-rdr/" + anchorName("", "", proxier.ipFamily)[:len("kube-svc-v4-")]
+	own := sets.New[string]()
+	for a := range anchors {
+		if strings.HasPrefix(a, prefix) {
+			own.Insert(a)
+		}
+	}
+	return own
+}
+
 func parseServiceAnchors(out string) sets.Set[string] {
 	anchors := sets.New[string]()
 	for _, anchor := range strings.Split(out, "\n") {
@@ -320,7 +332,7 @@ func (proxier *Proxier) checkAnchors() {
 		proxier.logger.V(2).Info("Listing PF anchors failed", "err", err)
 		return
 	}
-	if missing := synced.Difference(current); missing.Len() > 0 {
+	if missing := synced.Difference(proxier.familyAnchors(current)); missing.Len() > 0 {
 		proxier.logger.Info("PF rules of Services were removed, resyncing", "anchors", missing.Len())
 		proxier.mu.Lock()
 		proxier.needFullSync = true
@@ -1177,7 +1189,7 @@ func (proxier *Proxier) syncProxyRules() error {
 		}
 	}
 	if anchors, err := listServiceAnchors(proxier.exec); err == nil {
-		proxier.syncedAnchors = anchors
+		proxier.syncedAnchors = proxier.familyAnchors(anchors)
 	} else {
 		proxier.logger.V(2).Info("Listing PF anchors failed", "err", err)
 	}
