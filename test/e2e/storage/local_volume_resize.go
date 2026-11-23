@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	"k8s.io/kubernetes/test/e2e/storage/testsuites"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 	admissionapi "k8s.io/pod-security-admission/api"
@@ -54,6 +55,7 @@ var _ = utils.SIGDescribe("PersistentVolumes-expansion", func() {
 
 		testVolType := BlockFsWithFormatLocalVolumeType
 		var testVol *localTestVolume
+		var pod1 *v1.Pod
 		testMode := immediateMode
 		ginkgo.BeforeEach(func(ctx context.Context) {
 			nodes, err := e2enode.GetBoundedReadySchedulableNodes(ctx, f.ClientSet, maxNodes)
@@ -82,15 +84,19 @@ var _ = utils.SIGDescribe("PersistentVolumes-expansion", func() {
 			testVol = testVols[0]
 		})
 		ginkgo.AfterEach(func(ctx context.Context) {
+			// Delete the pod before unmounting the volume under it: on
+			// FreeBSD the container's nullfs mount keeps the loop file
+			// system busy until the pod is gone.
+			if pod1 != nil {
+				framework.ExpectNoError(e2epod.DeletePodWithWait(ctx, config.client, pod1))
+				pod1 = nil
+			}
 			cleanupLocalVolumes(ctx, config, []*localTestVolume{testVol})
 			cleanupStorageClass(ctx, config)
 		})
 
 		ginkgo.It("should support online expansion on node", func(ctx context.Context) {
-			var (
-				pod1    *v1.Pod
-				pod1Err error
-			)
+			var pod1Err error
 			ginkgo.By("Creating pod1")
 			pod1, pod1Err = createLocalPod(ctx, config, testVol, nil)
 			framework.ExpectNoError(pod1Err)

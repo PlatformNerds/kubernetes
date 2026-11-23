@@ -312,6 +312,15 @@ func (l *ltrMgr) expandLocalVolumeBlockFS(ctx context.Context, ltr *LocalTestRes
 	ddCmd := fmt.Sprintf("dd if=/dev/zero of=%s/file conv=notrunc oflag=append bs=1M count=%d", ltr.loopDir, mbToAdd)
 	loopDev := l.findLoopDevice(ctx, ltr.loopDir, ltr.Node)
 	losetupCmd := fmt.Sprintf("losetup -c %s", loopDev)
+	if isFreeBSD(ltr.Node) {
+		// The file system is mounted on loopDir, so loopDir/file names a
+		// file inside it, not the backing file (the Linux dd above appends
+		// to that inner file). Grow the md(4) device itself by mbToAdd:
+		// a vnode md may be larger than its backing file, which grows as
+		// the new blocks are written.
+		md := strings.TrimPrefix(loopDev, "/dev/")
+		return l.hostExec.IssueCommand(ctx, fmt.Sprintf("mdconfig -r -u %s -s $(( $(diskinfo %s | awk '{ print $3 }') / 1024 + %d * 1024 ))k", md, loopDev, mbToAdd), ltr.Node)
+	}
 	return l.hostExec.IssueCommand(ctx, fmt.Sprintf("%s && %s", ddCmd, losetupCmd), ltr.Node)
 }
 
