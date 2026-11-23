@@ -264,9 +264,14 @@ func (mounter *Mounter) GetMountRefs(pathname string) ([]string, error) {
 	return nullfsMountRefs(realpath, mps), nil
 }
 
-// nullfsMountRefs returns the nullfs mount points showing the same directory
-// as path, other than path: path's own source if path is a nullfs mount point,
-// otherwise path itself.
+// nullfsMountRefs returns the mount points showing the same directory as
+// path, other than path: the nullfs mounts of path's own source if path is a
+// nullfs mount point (otherwise of path itself), and that source when it is a
+// mount point too. Linux's GetMountRefs lists every mount of the same
+// directory the same way; the source being missing meant that a pod's mount of
+// a local volume on a disk didn't lead to the kubelet's global mount of the
+// disk, so the volume couldn't be reconstructed after a kubelet restart and
+// the disk stayed mounted.
 func nullfsMountRefs(path string, mps []MountPoint) []string {
 	path = filepath.Clean(path)
 	source := path
@@ -276,6 +281,14 @@ func nullfsMountRefs(path string, mps []MountPoint) []string {
 		}
 	}
 	refs := []string{}
+	if source != path {
+		for _, mp := range mps {
+			if filepath.Clean(mp.Path) == source {
+				refs = append(refs, source)
+				break
+			}
+		}
+	}
 	for _, mp := range mps {
 		p := filepath.Clean(mp.Path)
 		if mp.Type == "nullfs" && filepath.Clean(mp.Device) == source && p != path {

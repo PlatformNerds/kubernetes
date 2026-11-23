@@ -37,9 +37,13 @@ func TestNullfsMountRefs(t *testing.T) {
 		path string
 		want []string
 	}{
-		// A pod's mount point: the other pod's mount of the same source.
+		// A pod's mount point: its source, a mount point itself (the
+		// kubelet's global mount of a disk), and the other pod's mount of
+		// the same source.
 		{"/var/db/kubelet/pods/a/volumes/kubernetes.io~local-volume/pv",
-			[]string{"/var/db/kubelet/pods/b/volumes/kubernetes.io~local-volume/pv"}},
+			[]string{"/var/tmp/lpv", "/var/db/kubelet/pods/b/volumes/kubernetes.io~local-volume/pv"}},
+		// A pod's mount of a plain directory: no source mount point.
+		{"/var/db/kubelet/pods/c/volumes/kubernetes.io~local-volume/pv2", []string{}},
 		// The source directory: every nullfs mount of it.
 		{"/var/tmp/lpv/", []string{
 			"/var/db/kubelet/pods/a/volumes/kubernetes.io~local-volume/pv",
