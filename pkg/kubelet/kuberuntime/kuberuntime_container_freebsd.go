@@ -154,8 +154,26 @@ func toKubeContainerResources(statusResources *runtimeapi.ContainerResources) *k
 	}
 }
 
+// toKubeContainerUser converts the user CRI-O reports for a container. The
+// CRI and the API call it "linux", but it is the POSIX uid, gid and
+// supplementary groups, which FreeBSD containers have the same way (and the
+// pod's securityContext sets them through the same fields). The SupplementalGroupsPolicy
+// feature reports it in the container status.
 func toKubeContainerUser(statusUser *runtimeapi.ContainerUser) *kubecontainer.ContainerUser {
-	return nil
+	if statusUser == nil {
+		return nil
+	}
+
+	user := &kubecontainer.ContainerUser{}
+	if statusUser.GetLinux() != nil {
+		user.Linux = &kubecontainer.LinuxContainerUser{
+			UID:                statusUser.GetLinux().GetUid(),
+			GID:                statusUser.GetLinux().GetGid(),
+			SupplementalGroups: statusUser.GetLinux().GetSupplementalGroups(),
+		}
+	}
+
+	return user
 }
 
 func (m *kubeGenericRuntimeManager) GetContainerSwapBehavior(pod *v1.Pod, container *v1.Container) types.SwapBehavior {
