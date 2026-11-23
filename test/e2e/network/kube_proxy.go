@@ -307,6 +307,11 @@ var _ = common.SIGDescribe("KubeProxy", func() {
 			framework.Failf("failed to get proxy mode: err: %v; stdout: %s", stdout, err)
 		}
 		proxyMode := strings.TrimSpace(stdout)
+		// The metric only exists in iptables mode. Check the mode before
+		// reading route_localnet, which is a Linux /proc file.
+		if proxyMode != string(config.ProxyModeIPTables) {
+			e2eskipper.Skipf("test requires iptables proxy mode, not %q", proxyMode)
+		}
 
 		// get value of route_localnet
 		stdout, err = e2epodoutput.RunHostCmd(fr.Namespace.Name, hostExecPodName, "cat /proc/sys/net/ipv4/conf/all/route_localnet")
