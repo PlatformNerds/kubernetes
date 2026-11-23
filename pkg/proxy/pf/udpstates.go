@@ -117,7 +117,7 @@ func (proxier *Proxier) killStaleUDPStates(frontends udpFrontends) {
 	}
 	for _, s := range staleUDPStates(parseRdrStates(string(out)), frontends) {
 		proxier.logger.V(2).Info("Killing stale UDP state", "state", s.key(), "endpoint", s.endpoint)
-		if out, err := proxier.exec.Command("pfctl", "-k", "key", "-k", s.key()).CombinedOutput(); err != nil {
+		if out, err := runPfctl(proxier.exec, nil, "-k", "key", "-k", s.key()); err != nil {
 			klog.ErrorS(err, "Failed to kill stale UDP state", "state", s.key(), "output", string(out))
 		}
 	}

@@ -17,7 +17,6 @@ limitations under the License.
 package pf
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
@@ -991,7 +990,7 @@ func (proxier *Proxier) hostRedirectRule(af, proto, source string, destinationIP
 // "-F all": that would also flush the global state table and source nodes.
 func flushAnchor(execer utilexec.Interface, anchor string) error {
 	for _, what := range []string{"nat", "rules"} {
-		if out, err := execer.Command("pfctl", "-a", anchor, "-F", what).CombinedOutput(); err != nil {
+		if out, err := runPfctl(execer, nil, "-a", anchor, "-F", what); err != nil {
 			return fmt.Errorf("pfctl -a %s -F %s: %w: %s", anchor, what, err, out)
 		}
 	}
@@ -1055,6 +1054,7 @@ func (proxier *Proxier) syncProxyRules() error {
 		}
 	}
 
+	loadFailures := 0
 	// TODO: figure out if partial sync makes sense. For now, just re-write all the rules
 	proxier.svcPortMap.Update(proxier.serviceChanges)
 	proxier.endpointsMap.Update(proxier.endpointsChanges)
@@ -1181,11 +1181,9 @@ func (proxier *Proxier) syncProxyRules() error {
 			klog.Infof("EOF")
 		}
 		input := proxier.pfData.Bytes()
-		cmd := proxier.exec.Command("pfctl", "-a", "cni-rdr/"+svcInfo.anchorName, "-f", "-")
-		cmd.SetStdin(bytes.NewReader(input))
-		output, err := cmd.CombinedOutput()
-		if err != nil {
+		if output, err := runPfctl(proxier.exec, input, "-a", "cni-rdr/"+svcInfo.anchorName, "-f", "-"); err != nil {
 			klog.Errorf("error loading rules input: '%s', output: %s, err: %v", input, output, err)
+			loadFailures++
 		}
 	}
 	proxier.killStaleUDPStates(udpFronts)
@@ -1216,6 +1214,11 @@ func (proxier *Proxier) syncProxyRules() error {
 	}
 	if err := proxier.serviceHealthServer.SyncEndpoints(proxier.endpointsMap.LocalReadyEndpoints()); err != nil {
 		proxier.logger.Error(err, "Error syncing healthcheck endpoints")
+	}
+	// A Service whose anchor failed to load keeps its old rules (or none)
+	// until the next sync: ask the runner to retry.
+	if loadFailures > 0 {
+		return fmt.Errorf("%d pf anchor(s) failed to load", loadFailures)
 	}
 	return nil
 }
