@@ -114,7 +114,7 @@ func coreDNSAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset.Interfa
 		Image:                images.GetDNSImage(cfg),
 		ControlPlaneTaintKey: kubeadmconstants.LabelNodeRoleControlPlane,
 		Replicas:             replicas,
-		OS:                   runtime.GOOS,
+		OS:                   addonOS(),
 	})
 	if err != nil {
 		return errors.Wrap(err, "error when parsing CoreDNS deployment template")
@@ -416,4 +416,13 @@ func applyCoreDNSDeploymentPatches(coreDNSDeploymentBytes []byte, patchesDir str
 	}
 
 	return coreDNSDeploymentBytes, nil
+}
+
+// addonOS is the kubernetes.io/os the addon's pods select: the control plane's own OS where that is
+// FreeBSD, whose kubeadm deploys FreeBSD images, and linux otherwise, as upstream.
+func addonOS() string {
+	if runtime.GOOS == "freebsd" {
+		return "freebsd"
+	}
+	return "linux"
 }

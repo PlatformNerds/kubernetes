@@ -25,7 +25,7 @@ import (
 )
 
 func TestGetStaticPodDirectory(t *testing.T) {
-	expected := filepath.FromSlash("/etc/kubernetes/manifests")
+	expected := filepath.Join(KubernetesDir, "manifests")
 	actual := GetStaticPodDirectory()
 
 	if actual != expected {
@@ -51,7 +51,7 @@ func TestGetAdminKubeConfigPath(t *testing.T) {
 }
 
 func TestGetKubeletKubeConfigPath(t *testing.T) {
-	expected := filepath.FromSlash("/etc/kubernetes/kubelet.conf")
+	expected := filepath.Join(KubernetesDir, "kubelet.conf")
 	actual := GetKubeletKubeConfigPath()
 
 	if actual != expected {

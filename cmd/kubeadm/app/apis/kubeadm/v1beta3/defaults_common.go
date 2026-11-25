@@ -1,5 +1,4 @@
-//go:build linux || windows
-// +build linux windows
+//go:build !freebsd
 
 /*
 Copyright 2021 The Kubernetes Authors.
@@ -26,6 +25,4 @@ const (
 	DefaultManifestsDir = "/etc/kubernetes/manifests"
 	// DefaultEtcdDataDir defines default location of etcd where static pods will save data to
 	DefaultEtcdDataDir = "/var/lib/etcd"
-	// DefaultCertificatesDir defines default certificate directory
-	DefaultCertificatesDir = "/etc/kubernetes/pki"
 )

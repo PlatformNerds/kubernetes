@@ -251,7 +251,7 @@ func createKubeProxyAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset
 		Image:             images.GetKubernetesImage(constants.KubeProxy, cfg),
 		ProxyConfigMap:    constants.KubeProxyConfigMap,
 		ProxyConfigMapKey: constants.KubeProxyConfigMapKey,
-		ProxyOS:           runtime.GOOS,
+		ProxyOS:           addonOS(),
 	})
 	if err != nil {
 		return []byte(""), errors.Wrap(err, "error when parsing kube-proxy daemonset template")
@@ -271,4 +271,13 @@ func createKubeProxyAddon(cfg *kubeadmapi.ClusterConfiguration, client clientset
 
 	// Create the DaemonSet for kube-proxy or update it in case it already exists
 	return []byte(""), apiclient.CreateOrUpdate(client.AppsV1().DaemonSets(kubeproxyDaemonSet.GetNamespace()), kubeproxyDaemonSet)
+}
+
+// addonOS is the kubernetes.io/os the addon's pods select: the control plane's own OS where that is
+// FreeBSD, whose kubeadm deploys FreeBSD images, and linux otherwise, as upstream.
+func addonOS() string {
+	if runtime.GOOS == "freebsd" {
+		return "freebsd"
+	}
+	return "linux"
 }

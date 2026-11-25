@@ -61,10 +61,11 @@ func TestCompileManifests(t *testing.T) {
 		{
 			name:     "KubeProxyDaemonSet19",
 			manifest: KubeProxyDaemonSet19,
-			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
+			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey, ProxyOS string }{
 				Image:             "foo",
 				ProxyConfigMap:    "bar",
 				ProxyConfigMapKey: "baz",
+				ProxyOS:           "linux",
 			},
 		},
 	}
@@ -187,10 +188,11 @@ func TestDaemonSetsHaveSystemNodeCriticalPriorityClassName(t *testing.T) {
 		{
 			name:     "KubeProxyDaemonSet19",
 			manifest: KubeProxyDaemonSet19,
-			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey string }{
+			data: struct{ Image, ProxyConfigMap, ProxyConfigMapKey, ProxyOS string }{
 				Image:             "foo",
 				ProxyConfigMap:    "foo",
 				ProxyConfigMapKey: "foo",
+				ProxyOS:           "linux",
 			},
 		},
 	}

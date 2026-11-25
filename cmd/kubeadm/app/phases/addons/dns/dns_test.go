@@ -51,12 +51,13 @@ func TestCompileManifests(t *testing.T) {
 			name:     "CoreDNSDeployment manifest",
 			manifest: CoreDNSDeployment,
 			data: struct {
-				DeploymentName, Image, ControlPlaneTaintKey string
-				Replicas                                    *int32
+				DeploymentName, Image, ControlPlaneTaintKey, OS string
+				Replicas                                        *int32
 			}{
 				DeploymentName:       "foo",
 				Image:                "foo",
 				ControlPlaneTaintKey: "foo",
+				OS:                   "linux",
 				Replicas:             &replicas,
 			},
 		},
@@ -134,13 +135,14 @@ func TestDeploymentsHaveSystemClusterCriticalPriorityClassName(t *testing.T) {
 			name:     "CoreDNSDeployment",
 			manifest: CoreDNSDeployment,
 			data: struct {
-				DeploymentName, Image, ControlPlaneTaintKey, CoreDNSConfigMapName string
-				Replicas                                                          *int32
+				DeploymentName, Image, ControlPlaneTaintKey, CoreDNSConfigMapName, OS string
+				Replicas                                                              *int32
 			}{
 				DeploymentName:       "foo",
 				Image:                "foo",
 				ControlPlaneTaintKey: "foo",
 				CoreDNSConfigMapName: "foo",
+				OS:                   "linux",
 				Replicas:             &replicas,
 			},
 		},
@@ -884,8 +886,8 @@ metadata:
 				t.Errorf("coreDNSAddon() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if gotOut := out.String(); gotOut != tt.wantOut {
-				t.Errorf("Actual output of coreDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, tt.wantOut)
+			if gotOut, wantOut := out.String(), manifestForAddonOS(tt.wantOut); gotOut != wantOut {
+				t.Errorf("Actual output of coreDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, wantOut)
 			}
 		})
 	}
@@ -1173,8 +1175,8 @@ metadata:
 				t.Errorf("EnsureDNSAddon() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if gotOut := out.String(); gotOut != tt.wantOut {
-				t.Errorf("Actual output of EnsureDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, tt.wantOut)
+			if gotOut, wantOut := out.String(), manifestForAddonOS(tt.wantOut); gotOut != wantOut {
+				t.Errorf("Actual output of EnsureDNSAddon() does not match expected.\nActual:  %v\nExpected: %v\n", gotOut, wantOut)
 			}
 		})
 	}
@@ -1785,4 +1787,62 @@ func newMockClientForTest(t *testing.T, replicas int32, deploymentSize int, imag
 		}
 	}
 	return client
+}
+
+func TestCoreDNSDeploymentOS(t *testing.T) {
+	replicas := int32(2)
+	for _, tc := range []struct {
+		os           string
+		capabilities bool
+	}{
+		{os: "linux", capabilities: true},
+		{os: "windows", capabilities: true},
+		{os: "freebsd", capabilities: false},
+	} {
+		t.Run(tc.os, func(t *testing.T) {
+			b, err := kubeadmutil.ParseTemplate(CoreDNSDeployment, struct {
+				DeploymentName, Image, ControlPlaneTaintKey, CoreDNSConfigMapName, OS string
+				Replicas                                                              *int32
+			}{
+				DeploymentName:       "foo",
+				Image:                "foo",
+				ControlPlaneTaintKey: "foo",
+				CoreDNSConfigMapName: "foo",
+				OS:                   tc.os,
+				Replicas:             &replicas,
+			})
+			if err != nil {
+				t.Fatalf("ParseTemplate: %v", err)
+			}
+			d := &apps.Deployment{}
+			if err := runtime.DecodeInto(clientsetscheme.Codecs.UniversalDecoder(), b, d); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got := d.Spec.Template.Spec.NodeSelector[v1.LabelOSStable]; got != tc.os {
+				t.Errorf("nodeSelector %s = %q, want %q", v1.LabelOSStable, got, tc.os)
+			}
+			caps := d.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities
+			if (caps != nil) != tc.capabilities {
+				t.Errorf("capabilities = %v, want present: %v", caps, tc.capabilities)
+			}
+			if tc.capabilities && (len(caps.Drop) != 1 || caps.Drop[0] != "ALL" || len(caps.Add) != 1 || caps.Add[0] != "NET_BIND_SERVICE") {
+				t.Errorf("capabilities = %+v, want drop ALL, add NET_BIND_SERVICE", caps)
+			}
+		})
+	}
+}
+
+// manifestForAddonOS adapts an expected CoreDNS manifest, written for Linux, to the OS kubeadm deploys
+// CoreDNS for here: on FreeBSD it selects freebsd nodes and has no capabilities block.
+func manifestForAddonOS(m string) string {
+	if addonOS() != "freebsd" {
+		return m
+	}
+	m = strings.ReplaceAll(m, "kubernetes.io/os: linux", "kubernetes.io/os: freebsd")
+	return strings.ReplaceAll(m, `          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - ALL
+`, "")
 }

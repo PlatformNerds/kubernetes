@@ -143,11 +143,13 @@ spec:
             scheme: HTTP
         securityContext:
           allowPrivilegeEscalation: false
-          #capabilities:
-          #  add:
-          #  - NET_BIND_SERVICE
-          #  drop:
-          #  - ALL
+{{- if ne .OS "freebsd" }}
+          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - ALL
+{{- end }}
           readOnlyRootFilesystem: true
       dnsPolicy: Default
       volumes:
