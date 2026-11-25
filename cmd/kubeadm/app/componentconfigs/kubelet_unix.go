@@ -28,6 +28,7 @@ import (
 
 // Mutate allows applying pre-defined modifications to the config before it's marshaled.
 func (kc *kubeletConfig) Mutate() error {
+	mutatePlatformPaths(&kc.config)
 	if err := mutateResolverConfig(&kc.config, isServiceActive); err != nil {
 		return err
 	}
